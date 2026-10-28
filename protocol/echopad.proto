@@ -1,0 +1,185 @@
+// 手机端与电脑端之间的消息定义（ADR-0003）。
+// 每个 WebSocket 二进制帧承载一条消息：手机端发 ClientMessage，电脑端发 ServerMessage。
+syntax = "proto3";
+
+package echopad.v1;
+
+option java_package = "com.wbbb.echopad.mobile.protocol";
+
+// 手机端 → 电脑端
+message ClientMessage {
+  oneof body {
+    Hello hello = 1;
+    PointerMove pointer_move = 2;
+    ButtonAction button_action = 3;
+    Scroll scroll = 4;
+    DictationStart dictation_start = 5;
+    AudioChunk audio_chunk = 6;
+    DictationStop dictation_stop = 7;
+    TypeText type_text = 8;
+    KeyPress key_press = 9;
+    ShortcutAction shortcut_action = 10;
+  }
+}
+
+// 连接建立后的第一条消息，用于验证配对。
+message Hello {
+  string device_name = 1;
+  oneof credential {
+    // 首次配对：配对码里的一次性口令。
+    string pairing_token = 2;
+    // 已配对：配对成功时电脑端发放的设备密钥。
+    string device_key = 3;
+  }
+}
+
+// 指针的相对位移，单位为电脑屏幕上的点，已应用指针加速。
+message PointerMove {
+  float dx = 1;
+  float dy = 2;
+}
+
+enum MouseButton {
+  MOUSE_BUTTON_UNSPECIFIED = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_RIGHT = 2;
+}
+
+message ButtonAction {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_CLICK = 1;
+    KIND_DOUBLE_CLICK = 2;
+    // 拖拽开始时按下，结束时松开。
+    KIND_PRESS = 3;
+    KIND_RELEASE = 4;
+  }
+  MouseButton button = 1;
+  Kind kind = 2;
+}
+
+// 双指滑动的距离，单位为像素。内容跟随手指移动：手指向下滑，内容向下移动。
+message Scroll {
+  float dx = 1;
+  float dy = 2;
+}
+
+// 语音输入整理好的句子怎样上屏。
+enum DictationMode {
+  // 按直接上屏处理。
+  DICTATION_MODE_UNSPECIFIED = 0;
+  // 整理好立即输入到电脑的插入点。
+  DICTATION_MODE_DIRECT = 1;
+  // 先发回手机端的输入框，用户改好再发送。
+  DICTATION_MODE_COMPOSE = 2;
+}
+
+message DictationStart {
+  uint32 session_id = 1;
+  DictationMode mode = 2;
+}
+
+// 16kHz、16 位、单声道 PCM（小端）。
+message AudioChunk {
+  uint32 session_id = 1;
+  bytes pcm = 2;
+}
+
+message DictationStop {
+  uint32 session_id = 1;
+}
+
+// 输入框发送的文字，输入到电脑的插入点。
+message TypeText {
+  string text = 1;
+}
+
+// 特殊键：作用于电脑的单个功能键。
+message KeyPress {
+  enum Key {
+    KEY_UNSPECIFIED = 0;
+    KEY_ENTER = 1;
+    KEY_BACKSPACE = 2;
+    KEY_DELETE = 3;
+    KEY_TAB = 4;
+    KEY_ESCAPE = 5;
+    KEY_SPACE = 6;
+    KEY_UP = 7;
+    KEY_DOWN = 8;
+    KEY_LEFT = 9;
+    KEY_RIGHT = 10;
+    KEY_HOME = 11;
+    KEY_END = 12;
+    KEY_PAGE_UP = 13;
+    KEY_PAGE_DOWN = 14;
+  }
+  Key key = 1;
+}
+
+// 快捷操作：只描述意图，由电脑端按自己的系统换成组合键。
+message ShortcutAction {
+  enum Shortcut {
+    SHORTCUT_UNSPECIFIED = 0;
+    SHORTCUT_COPY = 1;
+    SHORTCUT_CUT = 2;
+    SHORTCUT_PASTE = 3;
+    SHORTCUT_UNDO = 4;
+    SHORTCUT_REDO = 5;
+    SHORTCUT_SELECT_ALL = 6;
+    SHORTCUT_SWITCH_APP = 7;
+  }
+  Shortcut shortcut = 1;
+}
+
+// 电脑端 → 手机端
+message ServerMessage {
+  oneof body {
+    Welcome welcome = 1;
+    Rejected rejected = 2;
+    InterimText interim_text = 3;
+    CommittedText committed_text = 4;
+    DictationFinished dictation_finished = 5;
+    DictationFailed dictation_failed = 6;
+    ComposeText compose_text = 7;
+  }
+}
+
+// 验证通过。首次配对时携带新发放的设备密钥，之后的连接为空。
+message Welcome {
+  string desktop_name = 1;
+  string device_key = 2;
+}
+
+message Rejected {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // 配对口令已失效，或设备密钥不再被电脑端认可。
+    REASON_INVALID_CREDENTIAL = 1;
+  }
+  Reason reason = 1;
+}
+
+message InterimText {
+  uint32 session_id = 1;
+  string text = 2;
+}
+
+message CommittedText {
+  uint32 session_id = 1;
+  string text = 2;
+}
+
+// 先编辑模式下整理好的一句话（含需要的分隔空格），追加到手机端的输入框末尾。
+message ComposeText {
+  uint32 session_id = 1;
+  string text = 2;
+}
+
+message DictationFinished {
+  uint32 session_id = 1;
+}
+
+message DictationFailed {
+  uint32 session_id = 1;
+  string message = 2;
+}

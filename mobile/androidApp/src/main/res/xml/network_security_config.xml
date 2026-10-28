@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 电脑端在局域网内用明文 WebSocket（ws://）通信，地址来自配对码，无法预先列出（docs/prd/pairing.md）。 -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
