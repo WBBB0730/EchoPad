@@ -1,6 +1,5 @@
 package com.wbbb.echopad.mobile.touchpad
 
-import com.wbbb.echopad.mobile.touchpad.TouchpadAction.DoubleClick
 import com.wbbb.echopad.mobile.touchpad.TouchpadAction.DragEnd
 import com.wbbb.echopad.mobile.touchpad.TouchpadAction.DragStart
 import com.wbbb.echopad.mobile.touchpad.TouchpadAction.Fling
@@ -16,35 +15,41 @@ class GestureRecognizerTest {
     private val recognizer = GestureRecognizer()
 
     @Test
-    fun aTapClicksOnceTheDoubleTapWindowPasses() {
+    fun aTapClicksAsSoonAsTheFingerLifts() {
         assertEquals(emptyList(), recognizer.down(1, 0f, 0f, 0))
-        assertEquals(emptyList(), recognizer.up(1, 0f, 0f, 50))
-        assertEquals(50 + GestureRecognizer.DOUBLE_TAP_WINDOW, recognizer.deadline)
-
-        assertEquals(emptyList(), recognizer.timeout(100))
-        assertEquals(listOf(LeftClick), recognizer.timeout(50 + GestureRecognizer.DOUBLE_TAP_WINDOW))
+        assertEquals(listOf(LeftClick), recognizer.up(1, 0f, 0f, 50))
         assertNull(recognizer.deadline)
     }
 
     @Test
-    fun twoQuickTapsDoubleClick() {
+    fun twoQuickTapsClickTwiceForTheDesktopToJoinIntoADoubleClick() {
         recognizer.down(1, 0f, 0f, 0)
-        recognizer.up(1, 0f, 0f, 50)
+        assertEquals(listOf(LeftClick), recognizer.up(1, 0f, 0f, 50))
         recognizer.down(2, 1f, 1f, 150)
-
-        assertEquals(listOf(DoubleClick), recognizer.up(2, 1f, 1f, 200))
-        assertEquals(emptyList(), recognizer.timeout(1_000))
+        assertEquals(listOf(LeftClick), recognizer.up(2, 1f, 1f, 200))
     }
 
     @Test
-    fun tapThenHoldAndMoveDrags() {
+    fun holdingStillStartsADrag() {
         recognizer.down(1, 0f, 0f, 0)
-        recognizer.up(1, 0f, 0f, 50)
-        recognizer.down(2, 0f, 0f, 150)
+        assertEquals(GestureRecognizer.HOLD_TIMEOUT, recognizer.deadline)
+        assertEquals(emptyList(), recognizer.timeout(100))
 
-        assertEquals(listOf(DragStart), recognizer.move(2, 20f, 0f, 200))
-        assertEquals(listOf(Move(10f, 0f, 16)), recognizer.move(2, 30f, 0f, 216))
-        assertEquals(listOf(DragEnd), recognizer.up(2, 30f, 0f, 230))
+        assertEquals(listOf(DragStart), recognizer.timeout(GestureRecognizer.HOLD_TIMEOUT))
+        assertNull(recognizer.deadline)
+        assertEquals(listOf(Move(10f, 0f, 16)), recognizer.move(1, 10f, 0f, GestureRecognizer.HOLD_TIMEOUT + 16))
+        assertEquals(listOf(DragEnd), recognizer.up(1, 10f, 0f, 300))
+    }
+
+    @Test
+    fun movingBeforeTheHoldTimeoutNeverDrags() {
+        recognizer.down(1, 0f, 0f, 0)
+        recognizer.move(1, 20f, 0f, 100)
+
+        assertNull(recognizer.deadline)
+        assertEquals(emptyList(), recognizer.timeout(GestureRecognizer.HOLD_TIMEOUT))
+        assertEquals(listOf(Move(10f, 0f, 200)), recognizer.move(1, 30f, 0f, 300))
+        assertEquals(emptyList(), recognizer.up(1, 30f, 0f, 310))
     }
 
     @Test

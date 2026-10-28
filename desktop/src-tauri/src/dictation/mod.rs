@@ -22,15 +22,6 @@ pub use pipeline::run as run_pipeline;
 /// 发往手机端的消息。
 pub type Outbound = mpsc::UnboundedSender<ServerMessage>;
 
-/// 整理好的句子怎样上屏。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DictationMode {
-    /// 立即输入到电脑的插入点。
-    Direct,
-    /// 发回手机端的输入框，用户改好再发送。
-    Compose,
-}
-
 pub enum AudioFrame {
     /// 16kHz、16 位、单声道 PCM。
     Pcm(Vec<u8>),
@@ -65,13 +56,7 @@ impl Cleaner for Verbatim {
 }
 
 pub trait DictationService: Send + Sync + 'static {
-    fn start(
-        &self,
-        session_id: u32,
-        mode: DictationMode,
-        input: Arc<dyn InputSink>,
-        outbound: Outbound,
-    ) -> DictationHandle;
+    fn start(&self, session_id: u32, input: Arc<dyn InputSink>, outbound: Outbound) -> DictationHandle;
 }
 
 /// 一次进行中的语音输入。被丢弃时中止所有尚未处理完的内容。
@@ -122,13 +107,7 @@ impl CloudDictation {
 }
 
 impl DictationService for CloudDictation {
-    fn start(
-        &self,
-        session_id: u32,
-        mode: DictationMode,
-        input: Arc<dyn InputSink>,
-        outbound: Outbound,
-    ) -> DictationHandle {
+    fn start(&self, session_id: u32, input: Arc<dyn InputSink>, outbound: Outbound) -> DictationHandle {
         let (audio, events, recognition) = match &self.recognition {
             RecognitionConfig::Doubao { api_key, resource_id } => {
                 doubao::start(api_key.clone(), resource_id.clone(), screen_context::current())
@@ -136,8 +115,8 @@ impl DictationService for CloudDictation {
             RecognitionConfig::Bailian { api_key } => bailian::start(api_key.clone()),
         };
         let pipeline = match &self.cleaner {
-            Some(cleaner) => tokio::spawn(run_pipeline(session_id, mode, events, cleaner.clone(), input, outbound)),
-            None => tokio::spawn(run_pipeline(session_id, mode, events, Arc::new(Verbatim), input, outbound)),
+            Some(cleaner) => tokio::spawn(run_pipeline(session_id, events, cleaner.clone(), input, outbound)),
+            None => tokio::spawn(run_pipeline(session_id, events, Arc::new(Verbatim), input, outbound)),
         };
         DictationHandle::new(audio, vec![recognition, pipeline])
     }

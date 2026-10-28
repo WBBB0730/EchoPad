@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use super::{Cleaner, DictationMode, Outbound, RecognitionEvent};
+use super::{Cleaner, Outbound, RecognitionEvent};
 use crate::{
     input::{InputCommand, InputSink},
     protocol::{
-        CommittedText, ComposeText, DictationFailed, DictationFinished, InterimText, ServerMessage,
-        server_message::Body,
+        CommittedText, DictationFailed, DictationFinished, InterimText, ServerMessage, server_message::Body,
     },
 };
 
@@ -18,14 +17,13 @@ const PRECEDING_CONTEXT_CHARS: usize = 200;
 
 pub async fn run<C: Cleaner>(
     session_id: u32,
-    mode: DictationMode,
     mut events: mpsc::UnboundedReceiver<RecognitionEvent>,
     cleaner: Arc<C>,
     input: Arc<dyn InputSink>,
     outbound: Outbound,
 ) {
     let (sentences, queue) = mpsc::unbounded_channel();
-    let committer = tokio::spawn(commit_sentences(session_id, mode, queue, cleaner, input, outbound.clone()));
+    let committer = tokio::spawn(commit_sentences(session_id, queue, cleaner, input, outbound.clone()));
 
     let mut failure = None;
     let mut last_interim = String::new();
@@ -62,7 +60,6 @@ pub async fn run<C: Cleaner>(
 
 async fn commit_sentences<C: Cleaner>(
     session_id: u32,
-    mode: DictationMode,
     mut queue: mpsc::UnboundedReceiver<String>,
     cleaner: Arc<C>,
     input: Arc<dyn InputSink>,
@@ -84,15 +81,8 @@ async fn commit_sentences<C: Cleaner>(
             continue;
         }
         let text = format!("{}{cleaned}", separator(&committed, cleaned));
-        match mode {
-            DictationMode::Direct => {
-                input.send(InputCommand::Text(text.clone()));
-                send(&outbound, Body::CommittedText(CommittedText { session_id, text: cleaned.to_owned() }));
-            }
-            DictationMode::Compose => {
-                send(&outbound, Body::ComposeText(ComposeText { session_id, text: text.clone() }));
-            }
-        }
+        input.send(InputCommand::Text(text.clone()));
+        send(&outbound, Body::CommittedText(CommittedText { session_id, text: cleaned.to_owned() }));
         committed.push_str(&text);
     }
 }
@@ -161,10 +151,6 @@ mod tests {
     }
 
     async fn run_events(events: Vec<RecognitionEvent>) -> (Arc<RecordingInput>, Vec<Body>) {
-        run_events_in(DictationMode::Direct, events).await
-    }
-
-    async fn run_events_in(mode: DictationMode, events: Vec<RecognitionEvent>) -> (Arc<RecordingInput>, Vec<Body>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         for event in events {
             event_tx.send(event).unwrap();
@@ -172,7 +158,7 @@ mod tests {
         drop(event_tx);
         let input = Arc::new(RecordingInput::default());
         let (outbound, mut messages) = mpsc::unbounded_channel();
-        run(7, mode, event_rx, Arc::new(BracketCleaner), input.clone(), outbound).await;
+        run(7, event_rx, Arc::new(BracketCleaner), input.clone(), outbound).await;
         let mut bodies = Vec::new();
         while let Ok(message) = messages.try_recv() {
             bodies.extend(message.body);
@@ -225,29 +211,6 @@ mod tests {
 
         assert_eq!(input.texts(), ["[第一句]"]);
         assert!(matches!(bodies.last(), Some(Body::DictationFailed(failed)) if failed.message == "识别失败"));
-    }
-
-    #[tokio::test]
-    async fn compose_mode_sends_sentences_back_instead_of_committing() {
-        let (input, bodies) = run_events_in(
-            DictationMode::Compose,
-            vec![
-                RecognitionEvent::Final("Hello world.".into()),
-                RecognitionEvent::Final("Next".into()),
-                RecognitionEvent::Finished,
-            ],
-        )
-        .await;
-
-        assert!(input.texts().is_empty());
-        let composed: Vec<_> = bodies
-            .iter()
-            .filter_map(|body| match body {
-                Body::ComposeText(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(composed, ["[Hello world.]", "[Next]"]);
     }
 
     #[test]

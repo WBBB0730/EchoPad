@@ -41,6 +41,17 @@ class TouchpadOutputTest {
     }
 
     @Test
+    fun speedSettingsScalePointerAndScroll() {
+        output.speed = TouchpadSpeed(pointer = 2f, scroll = 0.5f)
+        output.handle(TouchpadAction.Move(1f, 0f, 100))
+        output.scroll(0f, 4f)
+        output.flush()
+
+        assertEquals(1.2f * 2, assertNotNull(sent[0].pointer_move).dx, 0.001f)
+        assertEquals(4f * 2 * 0.5f, assertNotNull(sent[1].scroll).dy, 0.001f)
+    }
+
+    @Test
     fun dragsPressAndReleaseTheLeftButton() {
         output.handle(TouchpadAction.DragStart)
         output.handle(TouchpadAction.DragEnd)

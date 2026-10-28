@@ -9,7 +9,6 @@ sealed interface TouchpadAction {
     /** 双指离开触控区时的滑动速度（dp/ms），用于滚动惯性。 */
     data class Fling(val vx: Float, val vy: Float) : TouchpadAction
     data object LeftClick : TouchpadAction
-    data object DoubleClick : TouchpadAction
     data object RightClick : TouchpadAction
     data object DragStart : TouchpadAction
     data object DragEnd : TouchpadAction
@@ -17,10 +16,10 @@ sealed interface TouchpadAction {
 
 /**
  * 把触控区上的手指事件识别成手势（docs/prd/touchpad.md）：
- * 单指滑动移动指针，轻点左键，连续两次轻点双击，轻点后按住再移动拖拽，
+ * 单指滑动移动指针，轻点立即左键单击（连点两下由电脑识别成双击），按住不动一会儿再移动是拖拽，
  * 双指轻点右键，双指滑动滚动。三指及以上的手势第一版不处理。
  *
- * 轻点之后要等一小段时间，才能确定是单击、双击还是拖拽，等待的截止时间见 [deadline]，
+ * 按下后要等一小段时间，才能确定是不是要拖拽，等待的截止时间见 [deadline]，
  * 调用方需要在截止时间到达时调用 [timeout]。时间单位为毫秒，坐标单位为 dp。
  */
 class GestureRecognizer {
@@ -32,23 +31,20 @@ class GestureRecognizer {
 
     fun down(id: Long, x: Float, y: Float, time: Long): List<TouchpadAction> {
         pointers[id] = Point(x, y)
-        val actions = mutableListOf<TouchpadAction>()
         state = when (val current = state) {
-            State.Idle -> State.OneFinger(id, Point(x, y), time, time, moved = false, afterTap = false)
-            is State.TapPending -> {
-                deadline = null
-                State.OneFinger(id, Point(x, y), time, time, moved = false, afterTap = true)
+            State.Idle -> {
+                deadline = time + HOLD_TIMEOUT
+                State.OneFinger(id, Point(x, y), time, moved = false)
             }
             is State.OneFinger -> {
-                // 轻点后第二次按下时又加了一根手指：先补上那次单击。
-                if (current.afterTap) actions += TouchpadAction.LeftClick
+                deadline = null
                 State.TwoFingers(centroid(), time, scrolling = false)
             }
             is State.Dragging -> current
             is State.TwoFingers -> State.Ignoring
             State.Ignoring -> State.Ignoring
         }
-        return actions
+        return emptyList()
     }
 
     fun move(id: Long, x: Float, y: Float, time: Long): List<TouchpadAction> {
@@ -64,13 +60,9 @@ class GestureRecognizer {
                     actions += TouchpadAction.Move(dx, dy, time - current.lastTime)
                     state = current.copy(lastTime = time)
                 } else if (distance(current.down, Point(x, y)) > TAP_SLOP) {
-                    // 超出轻点范围之前的抖动不移动指针。
-                    state = if (current.afterTap) {
-                        actions += TouchpadAction.DragStart
-                        State.Dragging(id, time)
-                    } else {
-                        current.copy(moved = true, lastTime = time)
-                    }
+                    // 超出轻点范围之前的抖动不移动指针；开始移动后就不再变成拖拽。
+                    deadline = null
+                    state = current.copy(moved = true, lastTime = time)
                 }
             }
             is State.Dragging -> if (current.id == id) {
@@ -87,19 +79,21 @@ class GestureRecognizer {
                 }
                 state = current.copy(scrolling = scrolling)
             }
-            State.Idle, is State.TapPending, State.Ignoring -> Unit
+            State.Idle, State.Ignoring -> Unit
         }
         return actions
     }
 
     fun up(id: Long, x: Float, y: Float, time: Long): List<TouchpadAction> = move(id, x, y, time) + release(id, time)
 
+    /** 按住不动到了截止时间：按下左键，开始拖拽。 */
     fun timeout(time: Long): List<TouchpadAction> {
         val pending = deadline ?: return emptyList()
-        if (time < pending || state !is State.TapPending) return emptyList()
+        val current = state
+        if (time < pending || current !is State.OneFinger || current.moved) return emptyList()
         deadline = null
-        state = State.Idle
-        return listOf(TouchpadAction.LeftClick)
+        state = State.Dragging(current.id, time)
+        return listOf(TouchpadAction.DragStart)
     }
 
     private fun release(id: Long, time: Long): List<TouchpadAction> {
@@ -108,17 +102,10 @@ class GestureRecognizer {
         state = when (val current = state) {
             is State.OneFinger -> if (current.id != id) {
                 current
-            } else if (!current.moved && time - current.downTime <= TAP_TIMEOUT) {
-                if (current.afterTap) {
-                    actions += TouchpadAction.DoubleClick
-                    State.Idle
-                } else {
-                    deadline = time + DOUBLE_TAP_WINDOW
-                    State.TapPending
-                }
             } else {
-                // 轻点后第二次按住却没有移动：只算前一次的单击。
-                if (current.afterTap) actions += TouchpadAction.LeftClick
+                deadline = null
+                // 没有移动就是轻点，抬手立即单击，不等待。
+                if (!current.moved) actions += TouchpadAction.LeftClick
                 State.Idle
             }
             is State.Dragging -> if (current.id != id) {
@@ -136,7 +123,7 @@ class GestureRecognizer {
                 if (pointers.isEmpty()) State.Idle else State.Ignoring
             }
             State.Ignoring -> if (pointers.isEmpty()) State.Idle else State.Ignoring
-            State.Idle, is State.TapPending -> current
+            State.Idle -> current
         }
         return actions
     }
@@ -146,16 +133,12 @@ class GestureRecognizer {
 
     private sealed interface State {
         data object Idle : State
-        /** 一次轻点刚结束，等着看是否接着双击或拖拽。 */
-        data object TapPending : State
         data class OneFinger(
             val id: Long,
             val down: Point,
-            val downTime: Long,
             val lastTime: Long,
+            /** 已经超出轻点范围，在移动指针。 */
             val moved: Boolean,
-            /** 这次按下紧跟在一次轻点之后，可能是双击或拖拽。 */
-            val afterTap: Boolean,
         ) : State
         data class Dragging(val id: Long, val lastTime: Long) : State
         data class TwoFingers(
@@ -175,9 +158,8 @@ class GestureRecognizer {
     companion object {
         /** 移动不超过这个距离（dp）仍算轻点。 */
         const val TAP_SLOP = 8f
-        const val TAP_TIMEOUT = 220L
-        /** 轻点后在这段时间内再次按下，就是双击或拖拽。 */
-        const val DOUBLE_TAP_WINDOW = 220L
+        /** 按住不动超过这段时间，就开始拖拽。 */
+        const val HOLD_TIMEOUT = 250L
         const val TWO_FINGER_TAP_TIMEOUT = 300L
 
         /** 只用离开前这段时间内的滑动来估算速度。 */

@@ -5,7 +5,6 @@ import com.wbbb.echopad.mobile.connection.DesktopConnection
 import com.wbbb.echopad.mobile.protocol.AudioChunk
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.DictationStart
-import com.wbbb.echopad.mobile.protocol.DictationMode as ProtocolDictationMode
 import com.wbbb.echopad.mobile.protocol.DictationStop
 import com.wbbb.echopad.mobile.protocol.ServerMessage
 import kotlinx.coroutines.CoroutineScope
@@ -21,18 +20,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import okio.ByteString.Companion.toByteString
 
-/** 语音输入整理好的句子怎样上屏。 */
-enum class DictationMode {
-    /** 整理好立即输入到电脑的插入点。 */
-    Direct,
-
-    /** 先进入手机端的输入框，改好再发送（docs/prd/typing.md）。 */
-    Compose,
-}
-
 /**
  * 按住说话：按下时开始一次语音输入，录音实时发给电脑端，松开时结束（docs/prd/dictation.md）。
- * 识别过程中的临时文字只显示在手机端；整理好的句子由电脑端直接上屏，或者发回输入框。
+ * 识别过程中的临时文字只显示在手机端；整理好的句子由电脑端直接上屏。
  */
 class DictationController(
     private val connection: DesktopConnection,
@@ -58,14 +48,10 @@ class DictationController(
         }
     }
 
-    fun start(audio: Flow<ByteArray>, mode: DictationMode) {
+    fun start(audio: Flow<ByteArray>) {
         if (_speaking.value) return
         val id = ++sessionId
-        val protocolMode = when (mode) {
-            DictationMode.Direct -> ProtocolDictationMode.DICTATION_MODE_DIRECT
-            DictationMode.Compose -> ProtocolDictationMode.DICTATION_MODE_COMPOSE
-        }
-        if (!connection.send(ClientMessage(dictation_start = DictationStart(session_id = id, mode = protocolMode)))) return
+        if (!connection.send(ClientMessage(dictation_start = DictationStart(session_id = id)))) return
         _speaking.value = true
         _interimText.value = ""
         recording = scope.launch {

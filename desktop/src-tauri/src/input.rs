@@ -1,7 +1,7 @@
 //! 在电脑上模拟键鼠（ADR-0001、docs/prd/touchpad.md）。enigo 只在专用线程里使用。
 
 use std::{
-    sync::mpsc,
+    sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
@@ -17,7 +17,7 @@ pub enum MouseButton {
     Right,
 }
 
-/// 特殊键：作用于电脑的单个功能键（docs/prd/typing.md）。
+/// 特殊键：作用于电脑的单个按键，包括媒体键（docs/prd/typing.md）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecialKey {
     Enter,
@@ -34,6 +34,12 @@ pub enum SpecialKey {
     End,
     PageUp,
     PageDown,
+    PlayPause,
+    NextTrack,
+    PreviousTrack,
+    VolumeUp,
+    VolumeDown,
+    Mute,
 }
 
 /// 快捷操作：按电脑的系统换成对应的组合键。
@@ -119,9 +125,23 @@ impl<F: Fn(bool)> InputWorker<F> {
     fn run(mut self, commands: mpsc::Receiver<InputCommand>) {
         // 启动时就检查一次权限，让界面尽早显示授权状态。
         self.device.get();
-        for command in commands {
-            if let Err(err) = self.handle(command) {
-                tracing::warn!("input command failed: {err}");
+        loop {
+            // 缺少权限时不等手机端发来操作，到时间就重新检查，用户授权后界面立即更新。
+            let received = if self.device.is_ready() {
+                commands.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            } else {
+                commands.recv_timeout(PERMISSION_RETRY_INTERVAL)
+            };
+            match received {
+                Ok(command) => {
+                    if let Err(err) = self.handle(command) {
+                        tracing::warn!("input command failed: {err}");
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.device.get();
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     }
@@ -213,6 +233,10 @@ struct Device<F> {
 }
 
 impl<F: Fn(bool)> Device<F> {
+    fn is_ready(&self) -> bool {
+        self.enigo.is_some()
+    }
+
     fn get(&mut self) -> Option<&mut Enigo> {
         let due = self
             .last_attempt
@@ -323,6 +347,12 @@ impl From<SpecialKey> for Key {
             SpecialKey::End => Key::End,
             SpecialKey::PageUp => Key::PageUp,
             SpecialKey::PageDown => Key::PageDown,
+            SpecialKey::PlayPause => Key::MediaPlayPause,
+            SpecialKey::NextTrack => Key::MediaNextTrack,
+            SpecialKey::PreviousTrack => Key::MediaPrevTrack,
+            SpecialKey::VolumeUp => Key::VolumeUp,
+            SpecialKey::VolumeDown => Key::VolumeDown,
+            SpecialKey::Mute => Key::VolumeMute,
         }
     }
 }

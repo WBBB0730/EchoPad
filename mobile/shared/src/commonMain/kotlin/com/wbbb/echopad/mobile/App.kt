@@ -28,7 +28,7 @@ import kotlinx.coroutines.flow.emptyFlow
 fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
     val viewModel = viewModel { EchoPadViewModel(platform) }
     val state by viewModel.connection.state.collectAsStateWithLifecycle()
-    val dictationMode by viewModel.dictationMode.collectAsStateWithLifecycle()
+    val touchpadSpeed by viewModel.touchpadSpeed.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(viewModel, pairingLinks) { pairingLinks.collect(viewModel::onPairingLink) }
@@ -50,9 +50,9 @@ fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
                         state = state,
                         connection = viewModel.connection,
                         dictation = viewModel.dictation,
-                        composer = viewModel.composer,
-                        dictationMode = dictationMode,
-                        onDictationModeChange = viewModel::setDictationMode,
+                        keyboard = viewModel.keyboard,
+                        speed = touchpadSpeed,
+                        onSpeedChange = viewModel::setTouchpadSpeed,
                         onNotice = viewModel::notify,
                     )
                 }

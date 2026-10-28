@@ -12,30 +12,23 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wbbb.echopad.mobile.protocol.KeyPress
 import com.wbbb.echopad.mobile.protocol.ShortcutAction
 import com.wbbb.echopad.mobile.ui.EchoPadColors
 
+/** 手机键盘上没有的特殊键；退格、回车、空格用手机键盘自己的。 */
 private val SPECIAL_KEYS = listOf(
-    "退格" to KeyPress.Key.KEY_BACKSPACE,
-    "回车" to KeyPress.Key.KEY_ENTER,
-    "空格" to KeyPress.Key.KEY_SPACE,
-    "Tab" to KeyPress.Key.KEY_TAB,
     "Esc" to KeyPress.Key.KEY_ESCAPE,
+    "Tab" to KeyPress.Key.KEY_TAB,
     "←" to KeyPress.Key.KEY_LEFT,
     "→" to KeyPress.Key.KEY_RIGHT,
     "↑" to KeyPress.Key.KEY_UP,
@@ -57,47 +50,40 @@ private val SHORTCUTS = listOf(
     "切换应用" to ShortcutAction.Shortcut.SHORTCUT_SWITCH_APP,
 )
 
-/** 输入框、特殊键和快捷操作（docs/prd/typing.md）。 */
-@Composable
-fun KeyboardPanel(composer: Composer, connected: Boolean, modifier: Modifier = Modifier) {
-    val text by composer.text.collectAsStateWithLifecycle()
-    val haptics = LocalHapticFeedback.current
+private val MEDIA_KEYS = listOf(
+    "上一首" to KeyPress.Key.KEY_PREVIOUS_TRACK,
+    "播放/暂停" to KeyPress.Key.KEY_PLAY_PAUSE,
+    "下一首" to KeyPress.Key.KEY_NEXT_TRACK,
+    "音量 −" to KeyPress.Key.KEY_VOLUME_DOWN,
+    "静音" to KeyPress.Key.KEY_MUTE,
+    "音量 +" to KeyPress.Key.KEY_VOLUME_UP,
+)
 
+/** 手机键盘上方的一排特殊键和一排快捷操作（docs/prd/typing.md）。 */
+@Composable
+fun KeyboardPanel(keyboard: KeyboardInput, connected: Boolean, modifier: Modifier = Modifier) {
     Column(modifier.padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-                value = text,
-                onValueChange = composer::edit,
-                maxLines = 4,
-                shape = RoundedCornerShape(16.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = EchoPadColors.Text,
-                    unfocusedTextColor = EchoPadColors.Text,
-                    focusedBorderColor = EchoPadColors.TextMuted,
-                    unfocusedBorderColor = EchoPadColors.SurfaceRaised,
-                    cursorColor = EchoPadColors.Text,
-                ),
-                modifier = Modifier.weight(1f),
-            )
-            Button(onClick = { composer.send() }, enabled = connected && text.isNotEmpty()) {
-                Text("发送")
-            }
-        }
-        KeyRow(SPECIAL_KEYS, enabled = connected) { key ->
-            haptics.performHapticFeedback(HapticFeedbackType.KeyboardTap)
-            composer.press(key)
-        }
-        KeyRow(SHORTCUTS, enabled = connected) { shortcut ->
-            haptics.performHapticFeedback(HapticFeedbackType.KeyboardTap)
-            composer.shortcut(shortcut)
-        }
+        KeyRow(SPECIAL_KEYS, enabled = connected, onPress = keyboard::press)
+        KeyRow(SHORTCUTS, enabled = connected, onPress = keyboard::shortcut)
     }
 }
 
+/** 一排媒体键（docs/prd/typing.md）。 */
 @Composable
-private fun <T> KeyRow(keys: List<Pair<String, T>>, enabled: Boolean, onPress: (T) -> Unit) {
+fun MediaPanel(keyboard: KeyboardInput, connected: Boolean, modifier: Modifier = Modifier) {
+    KeyRow(MEDIA_KEYS, enabled = connected, onPress = keyboard::press, modifier = modifier.padding(horizontal = 12.dp))
+}
+
+@Composable
+private fun <T> KeyRow(
+    keys: List<Pair<String, T>>,
+    enabled: Boolean,
+    onPress: (T) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val haptics = LocalHapticFeedback.current
     Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        modifier = modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         for ((label, key) in keys) {
@@ -106,7 +92,10 @@ private fun <T> KeyRow(keys: List<Pair<String, T>>, enabled: Boolean, onPress: (
                     .height(40.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .background(EchoPadColors.SurfaceRaised)
-                    .clickable(enabled = enabled) { onPress(key) }
+                    .clickable(enabled = enabled) {
+                        haptics.performHapticFeedback(HapticFeedbackType.KeyboardTap)
+                        onPress(key)
+                    }
                     .padding(horizontal = 14.dp),
                 contentAlignment = Alignment.Center,
             ) {

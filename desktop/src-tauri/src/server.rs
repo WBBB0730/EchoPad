@@ -3,7 +3,10 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,12 +21,16 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitStream};
 use prost::Message as _;
-use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, mpsc},
+    time::timeout,
+};
 
 use crate::{
-    dictation::{DictationHandle, DictationMode, DictationService},
+    dictation::{DictationHandle, DictationService},
     input::{InputCommand, InputSink, MouseButton, Shortcut, SpecialKey},
-    pairing::{AuthOutcome, Credential, PairingStore, pairing_link},
+    pairing::{AuthOutcome, Credential, DeviceId, PairingStore, pairing_link},
     protocol::{
         self, ClientMessage, DictationFailed, Hello, Rejected, ServerMessage, Welcome,
         button_action::Kind, client_message, hello, key_press, rejected, server_message,
@@ -47,6 +54,14 @@ pub struct ServerContext {
     pub input: Arc<dyn InputSink>,
     /// 缺少语音输入的配置时为 `None`；保存设置后会被替换，不用重启电脑端。
     dictation: RwLock<Option<Arc<dyn DictationService>>>,
+    /// 当前的连接，电脑端断开连接时据此找到要关闭的连接。
+    sessions: Mutex<HashMap<u64, Session>>,
+    next_session_id: AtomicU64,
+}
+
+struct Session {
+    device: DeviceId,
+    close: Arc<Notify>,
 }
 
 impl ServerContext {
@@ -64,11 +79,29 @@ impl ServerContext {
             status,
             input,
             dictation: RwLock::new(None),
+            sessions: Mutex::new(HashMap::new()),
+            next_session_id: AtomicU64::new(1),
         }
     }
 
     pub fn pairing_link(&self) -> String {
         pairing_link(self.host, PORT, self.pairing.lock().unwrap().pairing_token())
+    }
+
+    /// 从电脑端断开一台手机端：作废它的设备密钥并关闭它的连接，之后它要重新扫码配对。
+    pub fn disconnect(&self, session_id: u64) -> anyhow::Result<()> {
+        let Some(device) = self.sessions.lock().unwrap().get(&session_id).map(|session| session.device.clone()) else {
+            return Ok(());
+        };
+        self.pairing.lock().unwrap().forget(&device)?;
+        self.close_sessions(|other| *other == device);
+        Ok(())
+    }
+
+    fn close_sessions(&self, matches: impl Fn(&DeviceId) -> bool) {
+        for session in self.sessions.lock().unwrap().values().filter(|session| matches(&session.device)) {
+            session.close.notify_one();
+        }
     }
 
     /// 之后开始的语音输入使用新的服务，进行中的语音输入不受影响。
@@ -93,26 +126,32 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
     let Ok(Some(hello)) = timeout(HELLO_TIMEOUT, read_hello(&mut reader)).await else {
         return;
     };
-    let (reply, accepted) = match authenticate(&context, &hello) {
-        Some(AuthOutcome::Paired { device_key }) => {
+    let (reply, device) = match authenticate(&context, &hello) {
+        Some(AuthOutcome::Paired { device_key, device }) => {
             context.status.set_pairing_link(context.pairing_link());
-            (welcome(&context, device_key), true)
+            // 一台电脑端只与一部手机端配对：原来那部的设备密钥已作废，它的连接也立即关闭。
+            context.close_sessions(|other| *other != device);
+            (welcome(&context, device_key), Some(device))
         }
-        Some(AuthOutcome::Recognized) => (welcome(&context, String::new()), true),
+        Some(AuthOutcome::Recognized(device)) => (welcome(&context, String::new()), Some(device)),
         Some(AuthOutcome::Rejected) | None => (
             server_message::Body::Rejected(Rejected {
                 reason: rejected::Reason::InvalidCredential.into(),
             }),
-            false,
+            None,
         ),
     };
-    if writer.send(encode(reply)).await.is_err() || !accepted {
+    let sent = writer.send(encode(reply)).await.is_ok();
+    let Some(device) = device.filter(|_| sent) else {
         let _ = writer.close().await;
         return;
-    }
+    };
 
+    let session_id = context.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let close = Arc::new(Notify::new());
+    context.sessions.lock().unwrap().insert(session_id, Session { device, close: close.clone() });
     let device_name = hello.device_name;
-    context.status.device_connected(&device_name);
+    context.status.device_connected(session_id, &device_name);
     tracing::info!(device = %device_name, "mobile app connected");
 
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -127,7 +166,14 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
     let mut dictations: HashMap<u32, DictationHandle> = HashMap::new();
     loop {
         // 任何帧（包括心跳）都会重置超时；超时或出错都按断线处理。
-        let frame = match timeout(IDLE_TIMEOUT, reader.next()).await {
+        let received = tokio::select! {
+            _ = close.notified() => {
+                tracing::info!(device = %device_name, "disconnected from the desktop app");
+                break;
+            }
+            received = timeout(IDLE_TIMEOUT, reader.next()) => received,
+        };
+        let frame = match received {
             Ok(Some(Ok(frame))) => frame,
             Ok(Some(Err(err))) => {
                 tracing::debug!("connection failed: {err}");
@@ -156,7 +202,8 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
     context.input.send(InputCommand::ReleaseAll);
     drop(dictations);
     forward.abort();
-    context.status.device_disconnected(&device_name);
+    context.sessions.lock().unwrap().remove(&session_id);
+    context.status.device_disconnected(session_id);
     tracing::info!(device = %device_name, "mobile app disconnected");
 }
 
@@ -229,14 +276,10 @@ fn dispatch(
         }),
         Body::DictationStart(start) => {
             dictations.retain(|_, handle| !handle.is_finished());
-            let mode = match start.mode() {
-                protocol::DictationMode::Compose => DictationMode::Compose,
-                protocol::DictationMode::Direct | protocol::DictationMode::Unspecified => DictationMode::Direct,
-            };
             let service = context.dictation.read().unwrap().clone();
             match service {
                 Some(service) => {
-                    let handle = service.start(start.session_id, mode, context.input.clone(), outbound.clone());
+                    let handle = service.start(start.session_id, context.input.clone(), outbound.clone());
                     dictations.insert(start.session_id, handle);
                 }
                 None => {
@@ -294,6 +337,12 @@ fn special_key(key: key_press::Key) -> Option<SpecialKey> {
         Key::End => SpecialKey::End,
         Key::PageUp => SpecialKey::PageUp,
         Key::PageDown => SpecialKey::PageDown,
+        Key::PlayPause => SpecialKey::PlayPause,
+        Key::NextTrack => SpecialKey::NextTrack,
+        Key::PreviousTrack => SpecialKey::PreviousTrack,
+        Key::VolumeUp => SpecialKey::VolumeUp,
+        Key::VolumeDown => SpecialKey::VolumeDown,
+        Key::Mute => SpecialKey::Mute,
         Key::Unspecified => return None,
     })
 }
@@ -361,13 +410,7 @@ mod tests {
     struct ScriptedDictation;
 
     impl DictationService for ScriptedDictation {
-        fn start(
-            &self,
-            session_id: u32,
-            mode: DictationMode,
-            input: Arc<dyn InputSink>,
-            outbound: Outbound,
-        ) -> DictationHandle {
+        fn start(&self, session_id: u32, input: Arc<dyn InputSink>, outbound: Outbound) -> DictationHandle {
             let (audio, mut audio_rx) = mpsc::unbounded_channel();
             let (events, events_rx) = mpsc::unbounded_channel();
             let recognition = tokio::spawn(async move {
@@ -381,8 +424,7 @@ mod tests {
                 let _ = events.send(RecognitionEvent::Final(format!("got {received} bytes")));
                 let _ = events.send(RecognitionEvent::Finished);
             });
-            let pipeline =
-                tokio::spawn(run_pipeline(session_id, mode, events_rx, Arc::new(UppercaseCleaner), input, outbound));
+            let pipeline = tokio::spawn(run_pipeline(session_id, events_rx, Arc::new(UppercaseCleaner), input, outbound));
             DictationHandle::new(audio, vec![recognition, pipeline])
         }
     }
@@ -419,6 +461,27 @@ mod tests {
             send(&mut client, client_message::Body::Hello(Hello { device_name: "Phone".into(), credential: Some(credential) })).await;
             let reply = receive(&mut client).await;
             (client, reply)
+        }
+
+        /// 等电脑端登记好刚连上的手机端，返回这次连接的编号。
+        async fn connected_device(&self) -> u64 {
+            for _ in 0..100 {
+                if let Some(device) = self.context.status.snapshot().connected_devices.first() {
+                    return device.id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the mobile app was not registered as connected");
+        }
+
+        async fn wait_until_no_device_is_connected(&self) {
+            for _ in 0..100 {
+                if self.context.status.snapshot().connected_devices.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the mobile app is still listed as connected");
         }
 
         /// 等电脑端处理完断线收尾。
@@ -523,7 +586,7 @@ mod tests {
         let harness = start_server(Some(Arc::new(ScriptedDictation))).await;
         let mut client = paired_client(&harness).await;
 
-        send(&mut client, client_message::Body::DictationStart(DictationStart { session_id: 1, mode: protocol::DictationMode::Direct.into() })).await;
+        send(&mut client, client_message::Body::DictationStart(DictationStart { session_id: 1 })).await;
         send(&mut client, client_message::Body::AudioChunk(AudioChunk { session_id: 1, pcm: vec![0; 3200] })).await;
         send(&mut client, client_message::Body::DictationStop(DictationStop { session_id: 1 })).await;
 
@@ -538,33 +601,12 @@ mod tests {
         let harness = start_server(Some(Arc::new(ScriptedDictation))).await;
         let mut client = paired_client(&harness).await;
 
-        send(&mut client, client_message::Body::DictationStart(DictationStart { session_id: 1, mode: protocol::DictationMode::Direct.into() })).await;
+        send(&mut client, client_message::Body::DictationStart(DictationStart { session_id: 1 })).await;
         send(&mut client, client_message::Body::AudioChunk(AudioChunk { session_id: 1, pcm: vec![0; 3200] })).await;
         drop(client);
         harness.wait_for_release_all().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert!(!harness.input.commands().iter().any(|command| matches!(command, InputCommand::Text(_))));
-    }
-
-    #[tokio::test]
-    async fn compose_mode_sends_sentences_back_to_the_compose_box() {
-        let harness = start_server(Some(Arc::new(ScriptedDictation))).await;
-        let mut client = paired_client(&harness).await;
-
-        send(
-            &mut client,
-            client_message::Body::DictationStart(DictationStart {
-                session_id: 2,
-                mode: protocol::DictationMode::Compose.into(),
-            }),
-        )
-        .await;
-        send(&mut client, client_message::Body::AudioChunk(AudioChunk { session_id: 2, pcm: vec![0; 10] })).await;
-        send(&mut client, client_message::Body::DictationStop(DictationStop { session_id: 2 })).await;
-
-        assert!(matches!(&receive(&mut client).await, server_message::Body::ComposeText(text) if text.text == "GOT 10 BYTES"));
-        assert!(matches!(receive(&mut client).await, server_message::Body::DictationFinished(_)));
         assert!(!harness.input.commands().iter().any(|command| matches!(command, InputCommand::Text(_))));
     }
 
@@ -575,6 +617,7 @@ mod tests {
 
         send(&mut client, client_message::Body::TypeText(TypeText { text: "你好 world".into() })).await;
         send(&mut client, client_message::Body::KeyPress(KeyPress { key: key_press::Key::Enter.into() })).await;
+        send(&mut client, client_message::Body::KeyPress(KeyPress { key: key_press::Key::PlayPause.into() })).await;
         send(
             &mut client,
             client_message::Body::ShortcutAction(ShortcutAction { shortcut: shortcut_action::Shortcut::Paste.into() }),
@@ -584,13 +627,49 @@ mod tests {
         harness.wait_for_release_all().await;
 
         assert_eq!(
-            harness.input.commands()[..3],
+            harness.input.commands()[..4],
             [
                 InputCommand::Text("你好 world".into()),
                 InputCommand::Key(SpecialKey::Enter),
+                InputCommand::Key(SpecialKey::PlayPause),
                 InputCommand::Shortcut(Shortcut::Paste),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn disconnecting_from_the_desktop_closes_the_connection_and_revokes_the_device_key() {
+        let harness = start_server(None).await;
+        let (mut client, reply) = harness.connect(hello::Credential::PairingToken(harness.pairing_token())).await;
+        let server_message::Body::Welcome(Welcome { device_key, .. }) = reply else {
+            panic!("expected pairing to succeed, got {reply:?}");
+        };
+        let id = harness.connected_device().await;
+
+        harness.context.disconnect(id).unwrap();
+
+        let closed = timeout(Duration::from_secs(2), client.next()).await.unwrap();
+        assert!(!matches!(closed, Some(Ok(tungstenite::Message::Binary(_)))));
+        harness.wait_until_no_device_is_connected().await;
+        let (_, reply) = harness.connect(hello::Credential::DeviceKey(device_key)).await;
+        assert!(matches!(reply, server_message::Body::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn pairing_a_new_phone_disconnects_the_previous_one() {
+        let harness = start_server(None).await;
+        let (mut first, reply) = harness.connect(hello::Credential::PairingToken(harness.pairing_token())).await;
+        let server_message::Body::Welcome(Welcome { device_key: first_key, .. }) = reply else {
+            panic!("expected pairing to succeed, got {reply:?}");
+        };
+        harness.connected_device().await;
+
+        let _second = paired_client(&harness).await;
+
+        let closed = timeout(Duration::from_secs(2), first.next()).await.unwrap();
+        assert!(!matches!(closed, Some(Ok(tungstenite::Message::Binary(_)))));
+        let (_, reply) = harness.connect(hello::Credential::DeviceKey(first_key)).await;
+        assert!(matches!(reply, server_message::Body::Rejected(_)));
     }
 
     #[tokio::test]
@@ -598,7 +677,7 @@ mod tests {
         let harness = start_server(None).await;
         let mut client = paired_client(&harness).await;
 
-        send(&mut client, client_message::Body::DictationStart(DictationStart { session_id: 9, mode: protocol::DictationMode::Direct.into() })).await;
+        send(&mut client, client_message::Body::DictationStart(DictationStart { session_id: 9 })).await;
 
         assert!(matches!(
             receive(&mut client).await,

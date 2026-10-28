@@ -10,10 +10,18 @@ use serde::Serialize;
 pub struct Status {
     pub pairing_link: String,
     pub pairing_qr_svg: String,
-    pub connected_devices: Vec<String>,
+    pub connected_devices: Vec<ConnectedDevice>,
     /// 尚未检查时为 `None`。
     pub input_permission: Option<bool>,
     pub dictation_ready: bool,
+}
+
+/// 一个已连接的手机端。`id` 区分每一次连接，电脑端断开连接时用它指定是哪一个。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectedDevice {
+    pub id: u64,
+    pub name: String,
 }
 
 pub struct StatusHub {
@@ -53,16 +61,12 @@ impl StatusHub {
         });
     }
 
-    pub fn device_connected(&self, name: &str) {
-        self.update(|status| status.connected_devices.push(name.to_owned()));
+    pub fn device_connected(&self, id: u64, name: &str) {
+        self.update(|status| status.connected_devices.push(ConnectedDevice { id, name: name.to_owned() }));
     }
 
-    pub fn device_disconnected(&self, name: &str) {
-        self.update(|status| {
-            if let Some(index) = status.connected_devices.iter().position(|device| device == name) {
-                status.connected_devices.remove(index);
-            }
-        });
+    pub fn device_disconnected(&self, id: u64) {
+        self.update(|status| status.connected_devices.retain(|device| device.id != id));
     }
 
     pub fn set_input_permission(&self, granted: bool) {

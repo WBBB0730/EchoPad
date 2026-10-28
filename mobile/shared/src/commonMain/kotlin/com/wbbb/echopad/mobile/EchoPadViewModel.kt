@@ -6,9 +6,9 @@ import com.wbbb.echopad.mobile.connection.ConnectionNotice
 import com.wbbb.echopad.mobile.connection.DesktopConnection
 import com.wbbb.echopad.mobile.connection.KtorTransport
 import com.wbbb.echopad.mobile.dictation.DictationController
-import com.wbbb.echopad.mobile.dictation.DictationMode
 import com.wbbb.echopad.mobile.pairing.PairingLink
-import com.wbbb.echopad.mobile.typing.Composer
+import com.wbbb.echopad.mobile.touchpad.TouchpadSpeed
+import com.wbbb.echopad.mobile.typing.KeyboardInput
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -23,10 +23,10 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
     private val transport = KtorTransport()
     val connection = DesktopConnection(storage.pairedDesktops, platform.deviceName, transport, viewModelScope)
     val dictation = DictationController(connection, viewModelScope)
-    val composer = Composer(connection, viewModelScope)
+    val keyboard = KeyboardInput(connection)
 
-    val dictationMode: StateFlow<DictationMode> =
-        storage.dictationMode.stateIn(viewModelScope, SharingStarted.Eagerly, DictationMode.Direct)
+    val touchpadSpeed: StateFlow<TouchpadSpeed> =
+        storage.touchpadSpeed.stateIn(viewModelScope, SharingStarted.Eagerly, TouchpadSpeed())
 
     private val _notices = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
@@ -47,8 +47,8 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
         if (link == null) notify("这不是 EchoPad 的配对码") else connection.pair(link)
     }
 
-    fun setDictationMode(mode: DictationMode) {
-        viewModelScope.launch { storage.setDictationMode(mode) }
+    fun setTouchpadSpeed(speed: TouchpadSpeed) {
+        viewModelScope.launch { storage.setTouchpadSpeed(speed) }
     }
 
     fun notify(message: String) {

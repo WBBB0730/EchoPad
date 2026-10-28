@@ -17,8 +17,9 @@ use serde::Serialize;
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_opener::OpenerExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -117,6 +118,20 @@ fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Resul
     state.save_settings(settings)
 }
 
+/// 从电脑端断开一台手机端，它之后要重新扫码配对。
+#[tauri::command]
+fn disconnect_device(state: tauri::State<'_, AppState>, id: u64) -> Result<(), String> {
+    state.server.disconnect(id).map_err(|err| format!("{err:#}"))
+}
+
+/// macOS「系统设置 › 隐私与安全性 › 辅助功能」页面。
+const ACCESSIBILITY_SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+#[tauri::command]
+fn open_accessibility_settings(app: AppHandle) -> Result<(), String> {
+    app.opener().open_url(ACCESSIBILITY_SETTINGS_URL, None::<&str>).map_err(|err| err.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -124,6 +139,7 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // 电脑端常驻在菜单栏，不占用程序坞。
             #[cfg(target_os = "macos")]
@@ -153,7 +169,13 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_status, get_settings, save_settings])
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            get_settings,
+            save_settings,
+            disconnect_device,
+            open_accessibility_settings
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
@@ -164,7 +186,7 @@ pub fn run() {
         });
 }
 
-/// 菜单栏图标：关掉窗口后从这里重新打开，或者退出电脑端。
+/// 菜单栏图标：左键点击打开窗口，右键点击是菜单（重新打开窗口或者退出电脑端）。
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 EchoPad", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -173,6 +195,12 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("EchoPad")
         .menu(&Menu::with_items(app, &[&open, &quit])?)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main_window(tray.app_handle());
+            }
+        })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
             "quit" => app.exit(0),

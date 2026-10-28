@@ -64,19 +64,11 @@ message Scroll {
   float dy = 2;
 }
 
-// 语音输入整理好的句子怎样上屏。
-enum DictationMode {
-  // 按直接上屏处理。
-  DICTATION_MODE_UNSPECIFIED = 0;
-  // 整理好立即输入到电脑的插入点。
-  DICTATION_MODE_DIRECT = 1;
-  // 先发回手机端的输入框，用户改好再发送。
-  DICTATION_MODE_COMPOSE = 2;
-}
-
 message DictationStart {
   uint32 session_id = 1;
-  DictationMode mode = 2;
+  // 曾用于先编辑模式，已去掉。
+  reserved 2;
+  reserved "mode";
 }
 
 // 16kHz、16 位、单声道 PCM（小端）。
@@ -89,12 +81,12 @@ message DictationStop {
   uint32 session_id = 1;
 }
 
-// 输入框发送的文字，输入到电脑的插入点。
+// 在手机键盘上选定的文字，输入到电脑的插入点。
 message TypeText {
   string text = 1;
 }
 
-// 特殊键：作用于电脑的单个功能键。
+// 特殊键：作用于电脑的单个按键，包括媒体键。
 message KeyPress {
   enum Key {
     KEY_UNSPECIFIED = 0;
@@ -112,6 +104,12 @@ message KeyPress {
     KEY_END = 12;
     KEY_PAGE_UP = 13;
     KEY_PAGE_DOWN = 14;
+    KEY_PLAY_PAUSE = 15;
+    KEY_NEXT_TRACK = 16;
+    KEY_PREVIOUS_TRACK = 17;
+    KEY_VOLUME_UP = 18;
+    KEY_VOLUME_DOWN = 19;
+    KEY_MUTE = 20;
   }
   Key key = 1;
 }
@@ -140,8 +138,10 @@ message ServerMessage {
     CommittedText committed_text = 4;
     DictationFinished dictation_finished = 5;
     DictationFailed dictation_failed = 6;
-    ComposeText compose_text = 7;
   }
+  // 曾用于先编辑模式，已去掉。
+  reserved 7;
+  reserved "compose_text";
 }
 
 // 验证通过。首次配对时携带新发放的设备密钥，之后的连接为空。
@@ -165,12 +165,6 @@ message InterimText {
 }
 
 message CommittedText {
-  uint32 session_id = 1;
-  string text = 2;
-}
-
-// 先编辑模式下整理好的一句话（含需要的分隔空格），追加到手机端的输入框末尾。
-message ComposeText {
   uint32 session_id = 1;
   string text = 2;
 }

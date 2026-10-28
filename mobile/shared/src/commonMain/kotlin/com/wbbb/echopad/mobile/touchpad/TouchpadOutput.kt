@@ -11,6 +11,9 @@ import com.wbbb.echopad.mobile.protocol.Scroll
  * 按键操作立即发送，并先发出之前累积的移动，保证顺序不乱。
  */
 class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
+    /** 用户设置的指针速度和滚动速度。 */
+    var speed = TouchpadSpeed()
+
     private var moveX = 0f
     private var moveY = 0f
     private var scrollX = 0f
@@ -20,13 +23,12 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
         when (action) {
             is TouchpadAction.Move -> {
                 val (x, y) = PointerAcceleration.apply(action.dx, action.dy, action.durationMillis)
-                moveX += x
-                moveY += y
+                moveX += x * speed.pointer
+                moveY += y * speed.pointer
             }
             is TouchpadAction.Scroll -> scroll(action.dx, action.dy)
             is TouchpadAction.Fling -> Unit
             TouchpadAction.LeftClick -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_CLICK)
-            TouchpadAction.DoubleClick -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_DOUBLE_CLICK)
             TouchpadAction.RightClick -> button(MouseButton.MOUSE_BUTTON_RIGHT, ButtonAction.Kind.KIND_CLICK)
             TouchpadAction.DragStart -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_PRESS)
             TouchpadAction.DragEnd -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_RELEASE)
@@ -35,8 +37,8 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
 
     /** 双指滑动的距离（dp）。 */
     fun scroll(dx: Float, dy: Float) {
-        scrollX += dx * SCROLL_GAIN
-        scrollY += dy * SCROLL_GAIN
+        scrollX += dx * SCROLL_GAIN * speed.scroll
+        scrollY += dy * SCROLL_GAIN * speed.scroll
     }
 
     fun flush() {
