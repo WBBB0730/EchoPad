@@ -5,6 +5,7 @@ plugins {
     alias(libs.plugins.androidMultiplatformLibrary)
     alias(libs.plugins.composeMultiplatform)
     alias(libs.plugins.composeCompiler)
+    alias(libs.plugins.kotlinSerialization)
     alias(libs.plugins.wire)
 }
 
@@ -70,9 +71,12 @@ kotlin {
             implementation(libs.androidx.datastore.preferencesCore)
             implementation(libs.kermit)
             implementation(libs.kotlinx.coroutines.core)
+            implementation(libs.kotlinx.serialization.json)
             implementation(libs.ktor.client.cio)
             implementation(libs.ktor.client.core)
             implementation(libs.ktor.client.websockets)
+            implementation(libs.markdown.renderer.m3)
+            implementation(libs.semver)
             implementation(libs.wire.runtime)
         }
         commonTest.dependencies {

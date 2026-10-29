@@ -67,6 +67,33 @@ cd mobile
 ./gradlew :shared:testAndroidHostTest
 ```
 
+## 发版
+
+两端共用一个版本号，只写在 `desktop/package.json`（ADR-0008）。先在仓库根的 `CHANGELOG.md` 里写好这一版的更新日志（写法见 `docs/prd/release.md`），再升版本号、提交、打 `vX.Y.Z` 标签并推送：
+
+```bash
+cd desktop
+pnpm release
+```
+
+GitHub Actions 看到标签后检查两端、打包，全部成功后发到 GitHub Release，两端的应用内更新随之生效（`docs/prd/in-app-update.md`）。发版需要在仓库的 GitHub Secrets 里配好以下内容，Apple 那几项与 DevCube 的同名 Secret 相同：
+
+| Secret | 内容 |
+|---|---|
+| `MAC_CSC_LINK` | Developer ID 证书（.p12）的 base64 |
+| `MAC_CSC_KEY_PASSWORD` | 证书的密码 |
+| `APPLE_API_KEY` | App Store Connect API Key（.p8）的 base64 |
+| `APPLE_API_KEY_ID` | API Key 的 Key ID |
+| `APPLE_API_ISSUER` | API Key 的 Issuer ID |
+| `TAURI_SIGNING_PRIVATE_KEY` | 电脑端更新签名私钥，对应的公钥写在 `tauri.conf.json` |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 更新签名私钥的密码 |
+| `ANDROID_KEYSTORE` | 手机端发版签名文件（.jks）的 base64 |
+| `ANDROID_KEYSTORE_PASSWORD` | 签名文件的密码 |
+| `ANDROID_KEY_ALIAS` | 签名密钥的别名 |
+| `ANDROID_KEY_PASSWORD` | 签名密钥的密码 |
+
+更新签名私钥和手机端签名文件一旦丢了或换了，已安装的用户就无法在应用内更新，务必另外离线备份。
+
 ## 调试
 
 - 电脑端的详细日志：用 `RUST_LOG=desktop_lib=debug pnpm tauri dev` 启动，日志里会打印当前的配对链接；换成 `trace` 还会打印每条键鼠命令。

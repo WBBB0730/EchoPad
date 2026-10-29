@@ -9,6 +9,7 @@ import com.wbbb.echopad.mobile.dictation.DictationController
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.touchpad.TouchpadSpeed
 import com.wbbb.echopad.mobile.typing.KeyboardInput
+import com.wbbb.echopad.mobile.update.AppUpdater
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -31,6 +32,7 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
     )
     val dictation = DictationController(connection, viewModelScope)
     val keyboard = KeyboardInput(connection)
+    val updater = platform.packages?.let(::AppUpdater)
 
     val touchpadSpeed: StateFlow<TouchpadSpeed> =
         storage.touchpadSpeed.stateIn(viewModelScope, SharingStarted.Eagerly, TouchpadSpeed())
@@ -57,6 +59,15 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
 
     fun setTouchpadSpeed(speed: TouchpadSpeed) {
         viewModelScope.launch { storage.setTouchpadSpeed(speed) }
+    }
+
+    /** 打开设置时 [force] 为 false，距上次检查不足 5 分钟就跳过；手动检查为 true。 */
+    fun checkForUpdates(force: Boolean) {
+        viewModelScope.launch { updater?.check(force) }
+    }
+
+    fun applyUpdate() {
+        viewModelScope.launch { updater?.apply() }
     }
 
     fun notify(message: String) {

@@ -14,7 +14,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.wbbb.echopad.mobile.connection.ConnectionState
 import com.wbbb.echopad.mobile.pairing.PairingScreen
@@ -29,10 +32,17 @@ fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
     val viewModel = viewModel { EchoPadViewModel(platform) }
     val state by viewModel.connection.state.collectAsStateWithLifecycle()
     val touchpadSpeed by viewModel.touchpadSpeed.collectAsStateWithLifecycle()
+    val update = viewModel.updater?.state?.collectAsStateWithLifecycle()?.value
     val snackbar = remember { SnackbarHostState() }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
 
     LaunchedEffect(viewModel, pairingLinks) { pairingLinks.collect(viewModel::onPairingLink) }
     LaunchedEffect(viewModel) { viewModel.notices.collect { snackbar.showSnackbar(it) } }
+    // 只在 App 处于前台时检查更新（docs/prd/in-app-update.md）。
+    LaunchedEffect(viewModel, lifecycle) {
+        val updater = viewModel.updater ?: return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) { updater.checkPeriodically() }
+    }
 
     MaterialTheme(colorScheme = darkColorScheme(background = EchoPadColors.Background)) {
         Scaffold(
@@ -55,6 +65,9 @@ fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
                         onSpeedChange = viewModel::setTouchpadSpeed,
                         onScanned = viewModel::onPairingLink,
                         onNotice = viewModel::notify,
+                        update = update,
+                        onCheckForUpdates = viewModel::checkForUpdates,
+                        onApplyUpdate = viewModel::applyUpdate,
                     )
                 }
             }

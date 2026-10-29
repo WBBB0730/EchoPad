@@ -75,6 +75,9 @@ import com.wbbb.echopad.mobile.typing.KeyboardPanel
 import com.wbbb.echopad.mobile.typing.MediaPanel
 import com.wbbb.echopad.mobile.typing.phoneKeyboard
 import com.wbbb.echopad.mobile.ui.EchoPadColors
+import com.wbbb.echopad.mobile.update.AboutRow
+import com.wbbb.echopad.mobile.update.UpdateSheet
+import com.wbbb.echopad.mobile.update.UpdateState
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
@@ -96,11 +99,16 @@ fun TouchpadScreen(
     onSpeedChange: (TouchpadSpeed) -> Unit,
     onScanned: (String) -> Unit,
     onNotice: (String) -> Unit,
+    /** 应用内更新的状态；平台不支持时为 null。 */
+    update: UpdateState?,
+    onCheckForUpdates: (force: Boolean) -> Unit,
+    onApplyUpdate: () -> Unit,
 ) {
     val connected = state is ConnectionState.Connected
     // 转屏后展开的面板保持不变。
     var panel by rememberSaveable { mutableStateOf<Panel?>(null) }
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
+    var updateOpen by rememberSaveable { mutableStateOf(false) }
     var desktopsOpen by rememberSaveable { mutableStateOf(false) }
     var scanning by rememberSaveable { mutableStateOf(false) }
     val desktops by connection.desktops.collectAsStateWithLifecycle()
@@ -125,6 +133,11 @@ fun TouchpadScreen(
     val settingsButton = @Composable {
         TextButton(onClick = { settingsOpen = true }) {
             Text("设置", color = EchoPadColors.TextMuted)
+            // 新版本可用时一直显示，直到装上。
+            if (update?.prompt == true) {
+                Spacer(Modifier.width(6.dp))
+                Box(Modifier.size(6.dp).clip(CircleShape).background(EchoPadColors.Connected))
+            }
         }
     }
     val mediaToggle = @Composable { PanelToggle("媒体", open = panel == Panel.Media) { togglePanel(Panel.Media) } }
@@ -190,7 +203,20 @@ fun TouchpadScreen(
     }
 
     if (settingsOpen) {
-        SpeedSheet(speed = speed, onSpeedChange = onSpeedChange, onDismiss = { settingsOpen = false })
+        SettingsSheet(
+            speed = speed,
+            onSpeedChange = onSpeedChange,
+            update = update,
+            onCheckForUpdates = onCheckForUpdates,
+            onUpdate = {
+                settingsOpen = false
+                updateOpen = true
+            },
+            onDismiss = { settingsOpen = false },
+        )
+    }
+    if (updateOpen && update?.prompt == true) {
+        UpdateSheet(state = update, onConfirm = onApplyUpdate, onDismiss = { updateOpen = false })
     }
     if (desktopsOpen) {
         DesktopListSheet(
@@ -514,18 +540,28 @@ private fun TalkButton(
     }
 }
 
-/** 指针速度和滚动速度，松手时保存。 */
+/** 设置：指针速度和滚动速度（松手时保存），最下面是版本号与检查更新。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SpeedSheet(speed: TouchpadSpeed, onSpeedChange: (TouchpadSpeed) -> Unit, onDismiss: () -> Unit) {
+private fun SettingsSheet(
+    speed: TouchpadSpeed,
+    onSpeedChange: (TouchpadSpeed) -> Unit,
+    update: UpdateState?,
+    onCheckForUpdates: (force: Boolean) -> Unit,
+    onUpdate: () -> Unit,
+    onDismiss: () -> Unit,
+) {
     var pointer by remember { mutableFloatStateOf(speed.pointer) }
     var scroll by remember { mutableFloatStateOf(speed.scroll) }
     val save = { onSpeedChange(TouchpadSpeed(pointer = pointer, scroll = scroll)) }
+    // 打开设置时检查更新，距上次检查不足 5 分钟就跳过。
+    LaunchedEffect(Unit) { onCheckForUpdates(false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = EchoPadColors.Surface) {
         Column(Modifier.padding(start = 24.dp, end = 24.dp, bottom = 24.dp)) {
             SpeedSlider("指针速度", pointer, onValueChange = { pointer = it }, onValueChangeFinished = save)
             SpeedSlider("滚动速度", scroll, onValueChange = { scroll = it }, onValueChangeFinished = save)
+            if (update != null) AboutRow(update, onCheck = { onCheckForUpdates(true) }, onUpdate = onUpdate)
         }
     }
 }

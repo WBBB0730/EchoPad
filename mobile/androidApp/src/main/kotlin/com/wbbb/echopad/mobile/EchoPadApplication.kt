@@ -5,6 +5,7 @@ import android.os.Build
 import android.provider.Settings
 import com.wbbb.echopad.mobile.connection.NsdDesktopFinder
 import com.wbbb.echopad.mobile.connection.networkChanges
+import com.wbbb.echopad.mobile.update.AndroidAppPackages
 
 class EchoPadApplication : Application() {
     /** 本机存储在一个进程里只能创建一次，所以放在 Application 里。 */
@@ -15,6 +16,7 @@ class EchoPadApplication : Application() {
             storage = LocalStorage.create(filesDir.resolve("echopad.preferences_pb").absolutePath),
             desktopFinder = NsdDesktopFinder(this),
             networkChanges = networkChanges(this),
+            packages = AndroidAppPackages(this),
         )
     }
 }
