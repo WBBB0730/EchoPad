@@ -46,7 +46,7 @@ fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
                         onScanned = viewModel::onPairingLink,
                         onScanUnavailable = { viewModel.notify("无法使用相机扫码") },
                     )
-                    ConnectionState.Connecting, is ConnectionState.Connected -> TouchpadScreen(
+                    ConnectionState.Connecting, is ConnectionState.Connected, is ConnectionState.VersionMismatch -> TouchpadScreen(
                         state = state,
                         connection = viewModel.connection,
                         dictation = viewModel.dictation,

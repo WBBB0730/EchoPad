@@ -6,6 +6,8 @@ import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.Hello
+import com.wbbb.echopad.mobile.protocol.ProtocolVersion
+import com.wbbb.echopad.mobile.protocol.Rejected
 import com.wbbb.echopad.mobile.protocol.ServerMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -45,7 +47,13 @@ sealed interface ConnectionState {
     data object Unpaired : ConnectionState
     data object Connecting : ConnectionState
     data class Connected(val desktopName: String) : ConnectionState
+
+    /** 和当前电脑版本不兼容（ADR-0010）：配对仍然有效，继续重连，直到较旧的一端更新。 */
+    data class VersionMismatch(val outdated: OutdatedApp) : ConnectionState
 }
+
+/** 版本不兼容时需要更新的一端。 */
+enum class OutdatedApp { Mobile, Desktop }
 
 /** 配过的一台电脑端，以及它是否在线。 */
 data class DesktopEntry(val id: String, val name: String, val online: Boolean)
@@ -85,6 +93,9 @@ class DesktopConnection(
 
     /** 各台电脑端是否在线，以及在线时的名称。没有记录的就是正在连接。 */
     private val online = MutableStateFlow<Map<String, String>>(emptyMap())
+
+    /** 和哪些电脑端版本不兼容，以及该更新哪一端；连上后清除。 */
+    private val mismatched = MutableStateFlow<Map<String, OutdatedApp>>(emptyMap())
     private val loaded = MutableStateFlow(false)
     private val outgoing = MutableStateFlow<Map<String, SendChannel<ByteArray>>>(emptyMap())
 
@@ -92,11 +103,13 @@ class DesktopConnection(
         desktops.map { DesktopEntry(it.id, online[it.id] ?: it.name, it.id in online) }
     }.stateIn(scope, SharingStarted.Eagerly, emptyList())
 
-    val state: StateFlow<ConnectionState> = combine(loaded, _activeId, online) { loaded, activeId, online ->
+    val state: StateFlow<ConnectionState> = combine(loaded, _activeId, online, mismatched) { loaded, activeId, online, mismatched ->
         when {
             !loaded -> ConnectionState.Starting
             activeId == null -> ConnectionState.Unpaired
-            else -> online[activeId]?.let(ConnectionState::Connected) ?: ConnectionState.Connecting
+            else -> online[activeId]?.let(ConnectionState::Connected)
+                ?: mismatched[activeId]?.let(ConnectionState::VersionMismatch)
+                ?: ConnectionState.Connecting
         }
     }.stateIn(scope, SharingStarted.Eagerly, ConnectionState.Starting)
 
@@ -252,8 +265,14 @@ class DesktopConnection(
                     // 每次断线后重新开始查找：系统会把当前的地址重新报一遍，包括新出现的网络（例如刚打开的手机热点）。
                     lookup = lookUp()
                 }
+                if (end !is SessionEnd.VersionMismatch) mismatched.update { it - id }
                 wait = when (end) {
                     SessionEnd.Dropped -> reconnectDelay(failures++)
+                    // 版本不兼容时保留配对，照常重连，较旧的一端更新后自动连上。
+                    is SessionEnd.VersionMismatch -> {
+                        mismatched.update { it + (id to end.outdated) }
+                        reconnectDelay(failures++)
+                    }
                     SessionEnd.NetworkChanged -> {
                         failures = 0
                         Duration.ZERO
@@ -268,6 +287,7 @@ class DesktopConnection(
         } finally {
             lookup.cancel()
             online.update { it - id }
+            mismatched.update { it - id }
         }
     }
 
@@ -307,13 +327,27 @@ class DesktopConnection(
         }
         return transport.connect(host, port, fingerprint) { session ->
             val hello = when (target) {
-                is Target.Pairing -> Hello(device_name = deviceName, phone_id = phoneId, pairing_token = target.link.token)
-                is Target.Paired -> Hello(device_name = deviceName, phone_id = phoneId, device_key = target.desktop.deviceKey)
+                is Target.Pairing -> Hello(
+                    device_name = deviceName,
+                    phone_id = phoneId,
+                    pairing_token = target.link.token,
+                    protocol_version = PROTOCOL_VERSION,
+                )
+                is Target.Paired -> Hello(
+                    device_name = deviceName,
+                    phone_id = phoneId,
+                    device_key = target.desktop.deviceKey,
+                    protocol_version = PROTOCOL_VERSION,
+                )
             }
             session.send(ClientMessage(hello = hello).encode())
 
-            val welcome = ServerMessage.ADAPTER.decode(session.receive()).welcome
-                ?: return@connect SessionEnd.Rejected
+            val reply = ServerMessage.ADAPTER.decode(session.receive())
+            reply.rejected?.takeIf { it.reason == Rejected.Reason.REASON_VERSION_MISMATCH }?.let { rejected ->
+                val outdated = if (PROTOCOL_VERSION < rejected.protocol_version) OutdatedApp.Mobile else OutdatedApp.Desktop
+                return@connect SessionEnd.VersionMismatch(outdated)
+            }
+            val welcome = reply.welcome ?: return@connect SessionEnd.Rejected
             val deviceKey = welcome.device_key.ifEmpty { (target as? Target.Paired)?.desktop?.deviceKey }
                 ?: return@connect SessionEnd.Rejected
             val desktop = PairedDesktop(id, welcome.desktop_name, host, port, deviceKey, fingerprint)
@@ -393,19 +427,24 @@ class DesktopConnection(
         class Rejected(val id: String, val pairing: Boolean) : Command
     }
 
-    private enum class SessionEnd {
-        Dropped,
-        Rejected,
+    private sealed interface SessionEnd {
+        data object Dropped : SessionEnd
+        data object Rejected : SessionEnd
 
         /** 还没连上时手机的网络变了。 */
-        NetworkChanged,
+        data object NetworkChanged : SessionEnd
 
         /** 还没连上时电脑换了地址。 */
-        Moved,
+        data object Moved : SessionEnd
+
+        data class VersionMismatch(val outdated: OutdatedApp) : SessionEnd
     }
 
     companion object {
         private val log = Logger.withTag("EchoPad.Connection")
+
+        /** 手机端的协议版本（ADR-0010）。 */
+        val PROTOCOL_VERSION = ProtocolVersion.PROTOCOL_VERSION_CURRENT.value
 
         private val RECONNECT_DELAYS = listOf(500.milliseconds, 1.seconds, 2.seconds, 4.seconds)
         private val MAX_RECONNECT_DELAY = 5.seconds

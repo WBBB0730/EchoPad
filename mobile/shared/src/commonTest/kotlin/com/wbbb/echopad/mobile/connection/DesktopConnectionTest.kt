@@ -149,6 +149,44 @@ class DesktopConnectionTest {
     }
 
     @Test
+    fun helloCarriesTheProtocolVersion() = runTest {
+        connect(MemoryStore(home))
+        assertEquals(DesktopConnection.PROTOCOL_VERSION, transport.sessions.receive().hello().protocol_version)
+    }
+
+    @Test
+    fun aVersionMismatchKeepsThePairingUntilTheOlderAppIsUpdated() = runTest {
+        val store = MemoryStore(home)
+        val connection = connect(store)
+        val notices = collectNotices(connection)
+
+        val first = transport.sessions.receive()
+        first.hello()
+        first.reply(versionMismatch(DesktopConnection.PROTOCOL_VERSION - 1))
+        runCurrent()
+        assertEquals(ConnectionState.VersionMismatch(OutdatedApp.Desktop), connection.state.value)
+        assertEquals(listOf(home), store.desktops)
+        assertEquals(emptyList(), notices)
+
+        // 重连期间仍显示该更新哪一端；电脑端更新之后照常连上。
+        advanceTimeBy(DesktopConnection.reconnectDelay(0).inWholeMilliseconds + 1)
+        val second = transport.sessions.receive()
+        assertEquals(ConnectionState.VersionMismatch(OutdatedApp.Desktop), connection.state.value)
+        welcome(second, "Mac")
+        assertEquals(ConnectionState.Connected("Mac"), connection.state.value)
+    }
+
+    @Test
+    fun aNewerDesktopAsksToUpdateThePhone() = runTest {
+        val connection = connect(MemoryStore(home))
+        val session = transport.sessions.receive()
+        session.hello()
+        session.reply(versionMismatch(DesktopConnection.PROTOCOL_VERSION + 1))
+        runCurrent()
+        assertEquals(ConnectionState.VersionMismatch(OutdatedApp.Mobile), connection.state.value)
+    }
+
+    @Test
     fun messagesAreDroppedWhileDisconnected() = runTest {
         val connection = connect(MemoryStore(home))
         val session = transport.sessions.receive()
@@ -348,6 +386,10 @@ class DesktopConnectionTest {
         runCurrent()
         return session
     }
+
+    private fun versionMismatch(desktopVersion: Int) = ServerMessage(
+        rejected = Rejected(reason = Rejected.Reason.REASON_VERSION_MISMATCH, protocol_version = desktopVersion),
+    )
 
     private fun TestScope.collectNotices(connection: DesktopConnection): List<ConnectionNotice> {
         val notices = mutableListOf<ConnectionNotice>()

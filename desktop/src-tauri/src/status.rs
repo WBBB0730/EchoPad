@@ -1,4 +1,4 @@
-//! 电脑端界面显示的状态：配对码、配过的手机端及是否在线、权限与语音输入是否可用。
+//! 电脑端界面显示的状态：配对码、配过的手机端及是否在线、版本是否兼容、权限与语音输入是否可用。
 
 use std::sync::Mutex;
 
@@ -11,9 +11,18 @@ pub struct Status {
     pub pairing_link: String,
     pub pairing_qr_svg: String,
     pub phones: Vec<PhoneStatus>,
+    /// 最近一次因版本不兼容拒绝连接时需要更新的一端；有手机端连上后清除（ADR-0010）。
+    pub outdated: Option<OutdatedApp>,
     /// 尚未检查时为 `None`。
     pub input_permission: Option<bool>,
     pub dictation_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutdatedApp {
+    Mobile,
+    Desktop,
 }
 
 /// 一部配过的手机端。`id` 是手机端的固定标识，取消配对、让它切换过来时用它指定是哪一部。
@@ -38,6 +47,7 @@ impl StatusHub {
                 pairing_link: String::new(),
                 pairing_qr_svg: String::new(),
                 phones: Vec::new(),
+                outdated: None,
                 input_permission: None,
                 dictation_ready: false,
             }),
@@ -59,6 +69,10 @@ impl StatusHub {
 
     pub fn set_phones(&self, phones: Vec<PhoneStatus>) {
         self.update(|status| status.phones = phones);
+    }
+
+    pub fn set_outdated(&self, app: Option<OutdatedApp>) {
+        self.update(|status| status.outdated = app);
     }
 
     pub fn set_input_permission(&self, granted: bool) {

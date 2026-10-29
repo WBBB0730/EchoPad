@@ -40,10 +40,12 @@ use crate::{
         button_action::Kind, client_message, hello, key_press, rejected, server_message, shortcut_action,
         zoom::Phase as ZoomPhase,
     },
-    status::{PhoneStatus, StatusHub},
+    status::{OutdatedApp, PhoneStatus, StatusHub},
 };
 
 pub const PORT: u16 = 47321;
+/// 电脑端的协议版本（ADR-0010）。
+pub const PROTOCOL_VERSION: u32 = protocol::ProtocolVersion::Current as u32;
 
 /// 连接建立后必须在这段时间内完成验证。
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -211,6 +213,17 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
     let Ok(Some(hello)) = timeout(HELLO_TIMEOUT, read_hello(&mut reader)).await else {
         return;
     };
+    // 先核对版本、再验证配对：版本不兼容时不消耗配对口令，配对仍然有效（ADR-0010）。
+    if hello.protocol_version != PROTOCOL_VERSION {
+        context.status.set_outdated(Some(outdated_app(hello.protocol_version)));
+        let reply = server_message::Body::Rejected(Rejected {
+            reason: rejected::Reason::VersionMismatch.into(),
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let _ = writer.send(encode(reply)).await;
+        let _ = writer.close().await;
+        return;
+    }
     let (reply, device) = match authenticate(&context, &hello) {
         Some(AuthOutcome::Paired { device_key, device }) => {
             context.status.set_pairing_link(context.pairing_link());
@@ -220,6 +233,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
         Some(AuthOutcome::Rejected) | None => (
             server_message::Body::Rejected(Rejected {
                 reason: rejected::Reason::InvalidCredential.into(),
+                ..Default::default()
             }),
             None,
         ),
@@ -229,6 +243,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
         let _ = writer.close().await;
         return;
     };
+    context.status.set_outdated(None);
 
     let session_id = context.next_session_id.fetch_add(1, Ordering::Relaxed);
     let close = Arc::new(Notify::new());
@@ -315,6 +330,11 @@ async fn read_hello(reader: &mut SplitStream<WebSocket>) -> Option<Hello> {
         }
     }
     None
+}
+
+/// 两端版本不兼容时，协议版本较小的一端需要更新。
+fn outdated_app(mobile_version: u32) -> OutdatedApp {
+    if mobile_version < PROTOCOL_VERSION { OutdatedApp::Mobile } else { OutdatedApp::Desktop }
 }
 
 fn authenticate(context: &ServerContext, hello: &Hello) -> Option<AuthOutcome> {
@@ -663,11 +683,21 @@ mod tests {
         }
 
         async fn connect(&self, phone_id: &str, credential: hello::Credential) -> (Client, server_message::Body) {
+            self.connect_with_version(phone_id, PROTOCOL_VERSION, credential).await
+        }
+
+        async fn connect_with_version(
+            &self,
+            phone_id: &str,
+            protocol_version: u32,
+            credential: hello::Credential,
+        ) -> (Client, server_message::Body) {
             let mut client = self.open().await;
             let hello = Hello {
                 device_name: format!("Phone {phone_id}"),
                 credential: Some(credential),
                 phone_id: phone_id.into(),
+                protocol_version,
             };
             send(&mut client, client_message::Body::Hello(hello)).await;
             let reply = receive(&mut client).await;
@@ -752,6 +782,31 @@ mod tests {
 
         let (_, reply) = harness.connect("phone-2", hello::Credential::PairingToken(token)).await;
         assert!(matches!(reply, server_message::Body::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn a_version_mismatch_is_rejected_without_using_the_pairing_token() {
+        let harness = start_server(None).await;
+        let token = harness.pairing_token();
+
+        let (_, reply) = harness
+            .connect_with_version("phone-1", PROTOCOL_VERSION + 1, hello::Credential::PairingToken(token.clone()))
+            .await;
+        let server_message::Body::Rejected(rejected) = reply else {
+            panic!("expected a version mismatch, got {reply:?}");
+        };
+        assert_eq!(rejected.reason(), rejected::Reason::VersionMismatch);
+        assert_eq!(rejected.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(harness.context.status.snapshot().outdated, Some(OutdatedApp::Desktop));
+
+        // 手机端更新之前的版本没有协议版本，按 0 处理。
+        harness.connect_with_version("phone-1", 0, hello::Credential::PairingToken(token.clone())).await;
+        assert_eq!(harness.context.status.snapshot().outdated, Some(OutdatedApp::Mobile));
+
+        let (_, reply) = harness.connect("phone-1", hello::Credential::PairingToken(token)).await;
+        assert!(matches!(reply, server_message::Body::Welcome(_)));
+        harness.wait_for_phones(&[("Phone phone-1", true)]).await;
+        assert_eq!(harness.context.status.snapshot().outdated, None);
     }
 
     #[tokio::test]

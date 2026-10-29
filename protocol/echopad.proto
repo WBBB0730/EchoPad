@@ -6,6 +6,13 @@ package echopad.v1;
 
 option java_package = "com.wbbb.echopad.mobile.protocol";
 
+// 两端的协议版本（ADR-0010），只用来取 CURRENT 的值。一端需要理解另一端的新内容时
+// （新增、删除消息或字段，或者改变了含义）把 CURRENT 加一。
+enum ProtocolVersion {
+  PROTOCOL_VERSION_UNSPECIFIED = 0;
+  PROTOCOL_VERSION_CURRENT = 1;
+}
+
 // 手机端 → 电脑端
 message ClientMessage {
   oneof body {
@@ -35,6 +42,8 @@ message Hello {
   }
   // 手机端的固定标识。同一部手机端再次扫码时，电脑端据此替换它原来的配对（ADR-0015）。
   string phone_id = 4;
+  // 手机端的协议版本，即 ProtocolVersion.PROTOCOL_VERSION_CURRENT。
+  uint32 protocol_version = 5;
 }
 
 // 指针的相对位移，单位为电脑屏幕上的点，已应用指针加速。
@@ -181,8 +190,12 @@ message Rejected {
     REASON_UNSPECIFIED = 0;
     // 配对口令已失效，或设备密钥不再被电脑端认可。
     REASON_INVALID_CREDENTIAL = 1;
+    // 两端的协议版本不一致。电脑端没有验证配对，配对仍然有效。
+    REASON_VERSION_MISMATCH = 2;
   }
   Reason reason = 1;
+  // 版本不兼容时为电脑端的协议版本，手机端据此判断该更新哪一端。
+  uint32 protocol_version = 2;
 }
 
 // 这次语音输入已经结束，整理好的文字已经上屏。

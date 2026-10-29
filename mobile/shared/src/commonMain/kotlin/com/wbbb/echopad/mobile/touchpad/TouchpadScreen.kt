@@ -66,6 +66,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wbbb.echopad.mobile.connection.ConnectionState
 import com.wbbb.echopad.mobile.connection.DesktopConnection
 import com.wbbb.echopad.mobile.connection.DesktopEntry
+import com.wbbb.echopad.mobile.connection.OutdatedApp
 import com.wbbb.echopad.mobile.dictation.DictationController
 import com.wbbb.echopad.mobile.dictation.rememberAudioCapture
 import com.wbbb.echopad.mobile.pairing.ScanOverlay
@@ -118,16 +119,8 @@ fun TouchpadScreen(
 
     val togglePanel = { target: Panel -> panel = if (panel == target) null else target }
     val connectionLabel = @Composable { modifier: Modifier ->
-        ConnectionLabel(
-            label = when {
-                state is ConnectionState.Connected -> state.desktopName.ifEmpty { "已连接" }
-                activeName != null -> "正在连接 $activeName"
-                else -> "正在连接…"
-            },
-            connected = connected,
-            // 点电脑名打开电脑列表，在那里切换、取消配对或添加电脑。
-            modifier = modifier.clickable { desktopsOpen = true },
-        )
+        // 点电脑名打开电脑列表，在那里切换、取消配对或添加电脑。
+        ConnectionLabel(state, activeName, modifier.clickable { desktopsOpen = true })
     }
     val settingsButton = @Composable {
         TextButton(onClick = { settingsOpen = true }) {
@@ -257,14 +250,19 @@ private fun BottomArea(
     }
 }
 
-/** 连接状态：圆点 + 电脑名称。 */
+/** 连接状态：圆点 + 电脑名称；版本不兼容时写该更新哪一端，圆点为灰色。 */
 @Composable
-private fun ConnectionLabel(label: String, connected: Boolean, modifier: Modifier = Modifier) {
+private fun ConnectionLabel(state: ConnectionState, activeName: String?, modifier: Modifier = Modifier) {
+    val (label, dot) = when (state) {
+        is ConnectionState.Connected -> state.desktopName.ifEmpty { "已连接" } to EchoPadColors.Connected
+        is ConnectionState.VersionMismatch -> when (state.outdated) {
+            OutdatedApp.Mobile -> "手机端需要更新"
+            OutdatedApp.Desktop -> "电脑端需要更新"
+        } to EchoPadColors.TextMuted
+        else -> (activeName?.let { "正在连接 $it" } ?: "正在连接…") to EchoPadColors.Connecting
+    }
     Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            Modifier.size(8.dp).clip(CircleShape)
-                .background(if (connected) EchoPadColors.Connected else EchoPadColors.Connecting),
-        )
+        Box(Modifier.size(8.dp).clip(CircleShape).background(dot))
         Spacer(Modifier.width(10.dp))
         Text(
             label,

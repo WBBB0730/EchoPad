@@ -12,9 +12,18 @@ type Status = {
   pairingLink: string;
   pairingQrSvg: string;
   phones: Phone[];
+  /** 版本不兼容时需要更新的一端（ADR-0010）。 */
+  outdated: "mobile" | "desktop" | null;
   inputPermission: boolean | null;
   dictationReady: boolean;
 };
+
+function connectionLabel(online: number, outdated: Status["outdated"]): string {
+  if (online > 0) return `${online} 部手机在线`;
+  if (outdated === "mobile") return "手机端需要更新";
+  if (outdated === "desktop") return "电脑端需要更新";
+  return "没有手机在线";
+}
 
 function App() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -92,7 +101,7 @@ function App() {
       )}
 
       <ul className="mt-8 w-full divide-y rounded-xl border bg-card text-sm">
-        <StatusRow ok={online > 0}>{online > 0 ? `${online} 部手机在线` : "没有手机在线"}</StatusRow>
+        <StatusRow ok={online > 0}>{connectionLabel(online, status.outdated)}</StatusRow>
         <StatusRow
           ok={status.inputPermission === true}
           action={
