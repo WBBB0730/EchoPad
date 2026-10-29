@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.1.0"
+# 版本号只写在 desktop/package.json，tauri.conf.json 从那里读取（ADR-0008）。
 description = "EchoPad desktop"
 authors = ["WBBB"]
 edition = "2024"

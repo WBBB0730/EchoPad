@@ -1,0 +1,212 @@
+# 推 v* 标签触发：检查 → Mac 与安卓打包 → 全部成功后一起发到 GitHub Release（docs/prd/release.md）
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.meta.outputs.notes }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Require tag commit on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 10
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # 标签与版本号一致、不带后缀；Release 正文取 CHANGELOG.md 里这一版那段，没写为空
+      - name: Resolve release metadata
+        id: meta
+        run: pnpm exec tsx scripts/release-meta.ts "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+  # 与打包同时进行：打包不用检查的任何结果，发布 job 要求两者都通过
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  mac:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 10
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Resolve pnpm store path
+        id: pnpm
+        run: echo "store=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      # 只读恢复 main 上 CI 写入的缓存：tag 上写的缓存别的 tag 看不到
+      - name: Restore pnpm store
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm.outputs.store }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('desktop/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop/src-tauri -> target
+          save-if: false
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # Apple 凭证与 DevCube 共用同一套；更新包另用 Tauri 更新签名私钥签名（ADR-0009）
+      - name: Package
+        run: |
+          : "${APPLE_CERTIFICATE:?Missing MAC_CSC_LINK}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?Missing MAC_CSC_KEY_PASSWORD}"
+          : "${APPLE_API_KEY_BASE64:?Missing APPLE_API_KEY}"
+          : "${APPLE_API_KEY:?Missing APPLE_API_KEY_ID}"
+          : "${APPLE_API_ISSUER:?Missing APPLE_API_ISSUER}"
+          : "${TAURI_SIGNING_PRIVATE_KEY:?Missing TAURI_SIGNING_PRIVATE_KEY}"
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          trap 'rm -f "$key_path"' EXIT
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 -D > "$key_path"
+          chmod 600 "$key_path"
+          if ! openssl pkey -in "$key_path" -noout >/dev/null 2>&1; then
+            echo '::error::APPLE_API_KEY is not a valid PKCS#8 private key'
+            exit 1
+          fi
+          export APPLE_API_KEY_PATH="$key_path"
+          # 更新包只在发版时生成：本机打包没有更新签名私钥
+          pnpm tauri build --bundles app,dmg --config '{"bundle":{"createUpdaterArtifacts":true}}'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.MAC_CSC_LINK }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Verify signature and notarization
+        run: |
+          app=src-tauri/target/release/bundle/macos/EchoPad.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+
+      # 更新清单里的下载地址指向本次 Release 上的更新包（ADR-0011）
+      - name: Write update manifest
+        run: |
+          bundle=src-tauri/target/release/bundle
+          pnpm exec tsx scripts/update-manifest.ts \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/EchoPad.app.tar.gz" \
+            "$bundle/macos/EchoPad.app.tar.gz.sig" latest.json
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$bundle"/dmg/*.dmg "$bundle/macos/EchoPad.app.tar.gz" "$bundle/macos/EchoPad.app.tar.gz.sig" latest.json \
+            "$RUNNER_TEMP/release/"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mac
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          compression-level: 0
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # 不在 main 上时只读缓存
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      # 每个版本都用同一个签名文件，新版本才能直接装在旧版本上面（ADR-0009）
+      - name: Package
+        run: |
+          : "${ANDROID_KEYSTORE:?Missing ANDROID_KEYSTORE}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Missing ANDROID_KEYSTORE_PASSWORD}"
+          : "${ANDROID_KEY_ALIAS:?Missing ANDROID_KEY_ALIAS}"
+          : "${ANDROID_KEY_PASSWORD:?Missing ANDROID_KEY_PASSWORD}"
+          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$ANDROID_KEYSTORE_PATH"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE" | base64 -d > "$ANDROID_KEYSTORE_PATH"
+          ./gradlew :androidApp:assembleRelease
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      # 手机端按版本号拼出 APK 的下载地址，文件名必须是这个格式（docs/prd/in-app-update.md）
+      - name: Verify signature
+        run: |
+          apk=androidApp/build/outputs/apk/release/androidApp-release.apk
+          apksigner="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 | sort -V | tail -1)/apksigner"
+          "$apksigner" verify --verbose "$apk"
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$apk" "$RUNNER_TEMP/release/EchoPad-${GITHUB_REF_NAME#v}.apk"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: [meta, check, mac, android]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --verify-tag --title "$GITHUB_REF_NAME" --notes "$NOTES" --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # 正文经环境变量传入，不直接拼进脚本
+          NOTES: ${{ needs.meta.outputs.notes }}
