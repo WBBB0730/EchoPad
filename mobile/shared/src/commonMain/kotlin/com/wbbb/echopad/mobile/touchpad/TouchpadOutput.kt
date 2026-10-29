@@ -5,10 +5,11 @@ import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.MouseButton
 import com.wbbb.echopad.mobile.protocol.PointerMove
 import com.wbbb.echopad.mobile.protocol.Scroll
+import com.wbbb.echopad.mobile.protocol.Zoom
 
 /**
- * 把手势换算成发给电脑端的消息。指针移动和滚动先累积，每帧屏幕刷新时由 [flush] 合并发送一次；
- * 按键操作立即发送，并先发出之前累积的移动，保证顺序不乱。
+ * 把手势换算成发给电脑端的消息。指针移动、滚动和缩放先累积，每帧屏幕刷新时由 [flush] 合并发送一次；
+ * 按键操作和缩放的开始、结束立即发送，并先发出之前累积的移动，保证顺序不乱。
  */
 class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
     /** 用户设置的指针速度和滚动速度。 */
@@ -18,6 +19,8 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
     private var moveY = 0f
     private var scrollX = 0f
     private var scrollY = 0f
+    /** 这一帧里两指距离累计变化的倍数。 */
+    private var zoomScale = 1f
 
     fun handle(action: TouchpadAction) {
         when (action) {
@@ -32,6 +35,9 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
             TouchpadAction.RightClick -> button(MouseButton.MOUSE_BUTTON_RIGHT, ButtonAction.Kind.KIND_CLICK)
             TouchpadAction.DragStart -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_PRESS)
             TouchpadAction.DragEnd -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_RELEASE)
+            TouchpadAction.ZoomStart -> zoom(Zoom.Phase.PHASE_BEGAN)
+            is TouchpadAction.Zoom -> zoomScale *= action.scale
+            TouchpadAction.ZoomEnd -> zoom(Zoom.Phase.PHASE_ENDED)
         }
     }
 
@@ -52,11 +58,20 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
             scrollX = 0f
             scrollY = 0f
         }
+        if (zoomScale != 1f) {
+            send(ClientMessage(zoom = Zoom(phase = Zoom.Phase.PHASE_CHANGED, magnification = zoomScale - 1)))
+            zoomScale = 1f
+        }
     }
 
     private fun button(button: MouseButton, kind: ButtonAction.Kind) {
         flush()
         send(ClientMessage(button_action = ButtonAction(button = button, kind = kind)))
+    }
+
+    private fun zoom(phase: Zoom.Phase) {
+        flush()
+        send(ClientMessage(zoom = Zoom(phase = phase)))
     }
 
     private companion object {

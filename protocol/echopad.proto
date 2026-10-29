@@ -19,6 +19,7 @@ message ClientMessage {
     TypeText type_text = 8;
     KeyPress key_press = 9;
     ShortcutAction shortcut_action = 10;
+    Zoom zoom = 11;
   }
 }
 
@@ -62,6 +63,19 @@ message ButtonAction {
 message Scroll {
   float dx = 1;
   float dy = 2;
+}
+
+// 双指捏合缩放，电脑上和触控板的捏合一样连续缩放。一次缩放以开始为首、以结束为尾。
+message Zoom {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_BEGAN = 1;
+    PHASE_CHANGED = 2;
+    PHASE_ENDED = 3;
+  }
+  Phase phase = 1;
+  // 两指距离相对上一条消息的变化比例减 1：放大为正，缩小为负。只在 PHASE_CHANGED 时有值。
+  float magnification = 2;
 }
 
 message DictationStart {

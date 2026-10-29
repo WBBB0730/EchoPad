@@ -34,7 +34,7 @@ use crate::{
     protocol::{
         self, ClientMessage, DictationFailed, Hello, Rejected, ServerMessage, Welcome,
         button_action::Kind, client_message, hello, key_press, rejected, server_message,
-        shortcut_action,
+        shortcut_action, zoom::Phase as ZoomPhase,
     },
     status::StatusHub,
 };
@@ -274,6 +274,17 @@ fn dispatch(
             dx: scroll.dx,
             dy: scroll.dy,
         }),
+        Body::Zoom(zoom) => {
+            let command = match zoom.phase() {
+                ZoomPhase::Began => InputCommand::ZoomStart,
+                ZoomPhase::Changed => InputCommand::Zoom {
+                    magnification: zoom.magnification,
+                },
+                ZoomPhase::Ended => InputCommand::ZoomEnd,
+                ZoomPhase::Unspecified => return,
+            };
+            context.input.send(command);
+        }
         Body::DictationStart(start) => {
             dictations.retain(|_, handle| !handle.is_finished());
             let service = context.dictation.read().unwrap().clone();
@@ -377,7 +388,7 @@ mod tests {
         dictation::{AudioFrame, Cleaner, Outbound, RecognitionEvent, run_pipeline},
         protocol::{
             AudioChunk, ButtonAction, DictationStart, DictationStop, KeyPress, PointerMove, ShortcutAction,
-            TypeText,
+            TypeText, Zoom,
         },
     };
 
@@ -556,6 +567,34 @@ mod tests {
         assert_eq!(
             harness.input.commands()[..2],
             [InputCommand::Move { dx: 3.0, dy: -2.0 }, InputCommand::Click(MouseButton::Right)]
+        );
+    }
+
+    #[tokio::test]
+    async fn zoom_messages_reach_the_input() {
+        let harness = start_server(None).await;
+        let mut client = paired_client(&harness).await;
+
+        for (phase, magnification) in [(ZoomPhase::Began, 0.0), (ZoomPhase::Changed, 0.25), (ZoomPhase::Ended, 0.0)] {
+            send(
+                &mut client,
+                client_message::Body::Zoom(Zoom {
+                    phase: phase.into(),
+                    magnification,
+                }),
+            )
+            .await;
+        }
+        client.close(None).await.unwrap();
+        harness.wait_for_release_all().await;
+
+        assert_eq!(
+            harness.input.commands()[..3],
+            [
+                InputCommand::ZoomStart,
+                InputCommand::Zoom { magnification: 0.25 },
+                InputCommand::ZoomEnd,
+            ]
         );
     }
 

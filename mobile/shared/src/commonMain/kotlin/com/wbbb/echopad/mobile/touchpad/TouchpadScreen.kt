@@ -50,6 +50,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
@@ -318,10 +319,13 @@ private fun TouchSurface(output: TouchpadOutput, modifier: Modifier) {
                     awaitPointerEventScope {
                         while (true) {
                             val event = awaitPointerEvent()
+                            fun PointerInputChange.point() = TouchPoint(position.x.toDp().value, position.y.toDp().value)
+                            // 同一次事件里移动的手指一起交给识别器，按下和抬起再逐个处理。
+                            val moved = event.changes.filter { it.pressed && it.previousPressed && it.positionChanged() }
+                            handle(recognizer.move(moved.associate { it.id.value to it.point() }, event.changes.first().uptimeMillis))
                             for (change in event.changes) {
                                 val id = change.id.value
-                                val x = change.position.x.toDp().value
-                                val y = change.position.y.toDp().value
+                                val (x, y) = change.point()
                                 val time = change.uptimeMillis
                                 val actions = when {
                                     change.changedToDownIgnoreConsumed() -> {
@@ -329,7 +333,6 @@ private fun TouchSurface(output: TouchpadOutput, modifier: Modifier) {
                                         recognizer.down(id, x, y, time)
                                     }
                                     change.changedToUpIgnoreConsumed() -> recognizer.up(id, x, y, time)
-                                    change.positionChanged() -> recognizer.move(id, x, y, time)
                                     else -> emptyList()
                                 }
                                 change.consume()

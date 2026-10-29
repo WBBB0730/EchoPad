@@ -3,6 +3,7 @@ package com.wbbb.echopad.mobile.touchpad
 import com.wbbb.echopad.mobile.protocol.ButtonAction
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.MouseButton
+import com.wbbb.echopad.mobile.protocol.Zoom
 import kotlin.math.abs
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -60,6 +61,24 @@ class TouchpadOutputTest {
             listOf(ButtonAction.Kind.KIND_PRESS, ButtonAction.Kind.KIND_RELEASE),
             sent.map { it.button_action?.kind },
         )
+    }
+
+    @Test
+    fun zoomIsSentOncePerFrameBetweenItsStartAndEnd() {
+        output.handle(TouchpadAction.ZoomStart)
+        output.handle(TouchpadAction.Zoom(1.25f))
+        output.handle(TouchpadAction.Zoom(1.2f))
+        output.flush()
+        output.handle(TouchpadAction.Zoom(0.5f))
+        output.handle(TouchpadAction.ZoomEnd)
+
+        assertEquals(
+            listOf(Zoom.Phase.PHASE_BEGAN, Zoom.Phase.PHASE_CHANGED, Zoom.Phase.PHASE_CHANGED, Zoom.Phase.PHASE_ENDED),
+            sent.map { it.zoom?.phase },
+        )
+        // 同一帧里的倍数相乘：1.25 × 1.2 = 1.5。
+        assertEquals(0.5f, assertNotNull(sent[1].zoom).magnification, 0.001f)
+        assertEquals(-0.5f, assertNotNull(sent[2].zoom).magnification, 0.001f)
     }
 }
 

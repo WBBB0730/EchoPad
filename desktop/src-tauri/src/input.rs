@@ -64,11 +64,16 @@ pub enum InputCommand {
     Release(MouseButton),
     /// 双指滑动的距离，单位为像素，内容跟随手指移动。
     Scroll { dx: f32, dy: f32 },
+    /// 双指捏合缩放开始，之后的缩放和结束都属于这一次。
+    ZoomStart,
+    /// 两指距离的变化比例减 1：放大为正，缩小为负。
+    Zoom { magnification: f32 },
+    ZoomEnd,
     /// 在插入点输入文字。
     Text(String),
     Key(SpecialKey),
     Shortcut(Shortcut),
-    /// 松开所有被按住的鼠标键，在连接断开时使用。
+    /// 松开所有被按住的鼠标键、结束进行中的缩放，在连接断开时使用。
     ReleaseAll,
 }
 
@@ -105,6 +110,8 @@ struct InputWorker<F> {
     pending_move: Fraction,
     pending_scroll: Fraction,
     held: Vec<MouseButton>,
+    /// 已经发出缩放开始、还没有发出结束。
+    zooming: bool,
 }
 
 impl<F: Fn(bool)> InputWorker<F> {
@@ -119,6 +126,7 @@ impl<F: Fn(bool)> InputWorker<F> {
             pending_move: Fraction::default(),
             pending_scroll: Fraction::default(),
             held: Vec::new(),
+            zooming: false,
         }
     }
 
@@ -154,6 +162,8 @@ impl<F: Fn(bool)> InputWorker<F> {
                 if (x, y) != (0, 0)
                     && let Some(enigo) = self.device.get()
                 {
+                    #[cfg(target_os = "macos")]
+                    let (x, y) = displays::confine(enigo.location()?, (x, y));
                     enigo.move_mouse(x, y, Coordinate::Rel)?;
                 }
             }
@@ -195,6 +205,20 @@ impl<F: Fn(bool)> InputWorker<F> {
                     }
                 }
             }
+            InputCommand::ZoomStart => {
+                // 上一次缩放没收到结束（比如手机端的触控区被关掉了），先把它结束，保证每次缩放都有开始和结束。
+                self.end_zoom();
+                if self.device.get().is_some() {
+                    post_zoom(ZoomPhase::Began, 0.0);
+                    self.zooming = true;
+                }
+            }
+            InputCommand::Zoom { magnification } => {
+                if self.zooming {
+                    post_zoom(ZoomPhase::Changed, magnification.into());
+                }
+            }
+            InputCommand::ZoomEnd => self.end_zoom(),
             InputCommand::Text(text) => {
                 if let Some(enigo) = self.device.get() {
                     enigo.text(&text)?;
@@ -212,6 +236,7 @@ impl<F: Fn(bool)> InputWorker<F> {
                 }
             }
             InputCommand::ReleaseAll => {
+                self.end_zoom();
                 let held = std::mem::take(&mut self.held);
                 if let Some(enigo) = self.device.get() {
                     for button in held {
@@ -221,6 +246,12 @@ impl<F: Fn(bool)> InputWorker<F> {
             }
         }
         Ok(())
+    }
+
+    fn end_zoom(&mut self) {
+        if std::mem::take(&mut self.zooming) {
+            post_zoom(ZoomPhase::Ended, 0.0);
+        }
     }
 }
 
@@ -279,6 +310,152 @@ impl Fraction {
         (x as i32, y as i32)
     }
 }
+
+/// macOS 不会替模拟的移动挡住屏幕边缘：移到屏幕外的位置会被系统原样记下，指针虽然停在边上，
+/// 往回移动时却要先走完超出的距离。所以每次移动前先把目标限制在显示器上；其他系统自己会挡住。
+#[cfg(target_os = "macos")]
+mod displays {
+    use objc2_core_foundation::CGRect;
+    use objc2_core_graphics::{CGDisplayBounds, CGError, CGGetActiveDisplayList};
+
+    /// 一块显示器在全局坐标中的范围，单位为点，不含右边和下边。
+    #[derive(Debug, Clone, Copy)]
+    struct Bounds {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    impl Bounds {
+        fn contains(&self, (x, y): (i32, i32)) -> bool {
+            (self.left..self.right).contains(&x) && (self.top..self.bottom).contains(&y)
+        }
+
+        fn clamp(&self, (x, y): (i32, i32)) -> (i32, i32) {
+            (x.clamp(self.left, self.right - 1), y.clamp(self.top, self.bottom - 1))
+        }
+
+        fn distance_squared(&self, point: (i32, i32)) -> i64 {
+            let (x, y) = self.clamp(point);
+            let (dx, dy) = (i64::from(point.0 - x), i64::from(point.1 - y));
+            dx * dx + dy * dy
+        }
+    }
+
+    impl From<CGRect> for Bounds {
+        fn from(rect: CGRect) -> Self {
+            let (min, max) = (rect.min(), rect.max());
+            Self {
+                left: min.x as i32,
+                top: min.y as i32,
+                right: max.x as i32,
+                bottom: max.y as i32,
+            }
+        }
+    }
+
+    /// 把指针从 `from` 出发的位移限制在显示器上，返回限制后的位移。
+    pub fn confine(from: (i32, i32), delta: (i32, i32)) -> (i32, i32) {
+        confine_within(&active(), from, delta)
+    }
+
+    /// 目标落在任意一块显示器上就照常移动；否则贴着指针所在显示器的边移动。
+    /// 指针本身已在所有显示器之外（比如刚拔掉显示器）时，先拉回最近的一块。
+    fn confine_within(displays: &[Bounds], from: (i32, i32), (dx, dy): (i32, i32)) -> (i32, i32) {
+        let target = (from.0 + dx, from.1 + dy);
+        if displays.iter().any(|display| display.contains(target)) {
+            return (dx, dy);
+        }
+        let Some(nearest) = displays.iter().min_by_key(|display| display.distance_squared(from)) else {
+            return (dx, dy);
+        };
+        let (x, y) = nearest.clamp(target);
+        (x - from.0, y - from.1)
+    }
+
+    /// 每次都重新读取，接上或拔掉显示器、改分辨率之后照常工作。
+    fn active() -> Vec<Bounds> {
+        const MAX_DISPLAYS: u32 = 32;
+        let mut ids = [0; MAX_DISPLAYS as usize];
+        let mut count = 0;
+        let error = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS, ids.as_mut_ptr(), &mut count) };
+        if error != CGError::Success {
+            tracing::warn!("failed to list displays: {error:?}");
+            return Vec::new();
+        }
+        ids[..count as usize].iter().map(|&id| CGDisplayBounds(id).into()).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 一块 1920×1080 的主显示器，右侧是一块竖放的显示器，两块的上下边缘不对齐。
+        const DISPLAYS: [Bounds; 2] = [
+            Bounds { left: 0, top: 0, right: 1920, bottom: 1080 },
+            Bounds { left: 1920, top: -293, right: 3000, bottom: 1627 },
+        ];
+
+        #[test]
+        fn movement_within_displays_is_unchanged() {
+            assert_eq!(confine_within(&DISPLAYS, (500, 500), (30, -20)), (30, -20));
+            // 跨到相邻的显示器上。
+            assert_eq!(confine_within(&DISPLAYS, (1910, 100), (30, -150)), (30, -150));
+        }
+
+        #[test]
+        fn movement_past_an_edge_stops_at_the_edge() {
+            assert_eq!(confine_within(&DISPLAYS, (2990, 500), (40, 0)), (9, 0));
+            // 沿着边缘滑动。
+            assert_eq!(confine_within(&DISPLAYS, (100, 2), (10, -5)), (10, -2));
+            // 两块显示器上下边缘不对齐的地方。
+            assert_eq!(confine_within(&DISPLAYS, (1925, -200), (-10, 0)), (-5, 0));
+        }
+
+        #[test]
+        fn pointer_outside_every_display_returns_to_the_nearest_one() {
+            assert_eq!(confine_within(&DISPLAYS, (-300, 500), (10, 0)), (300, 0));
+        }
+    }
+}
+
+/// 缩放手势的阶段，取值与 macOS 的手势阶段一致。
+#[derive(Debug, Clone, Copy)]
+enum ZoomPhase {
+    Began = 1,
+    Changed = 2,
+    Ended = 4,
+}
+
+/// 发出和触控板捏合一样的缩放手势，交给指针下的应用。macOS 没有公开接口能模拟手势，
+/// 这里用的是未公开的手势事件字段（ADR-0012）。
+#[cfg(target_os = "macos")]
+fn post_zoom(phase: ZoomPhase, magnification: f64) {
+    use objc2_core_graphics::{CGEvent, CGEventField, CGEventTapLocation, CGEventType};
+
+    /// 手势事件。
+    const GESTURE: CGEventType = CGEventType(29);
+    /// 手势种类，8 是缩放。
+    const GESTURE_HID_TYPE: CGEventField = CGEventField(110);
+    const GESTURE_HID_TYPE_ZOOM: i64 = 8;
+    const GESTURE_ZOOM_VALUE: CGEventField = CGEventField(113);
+    const GESTURE_PHASE: CGEventField = CGEventField(132);
+
+    let Some(event) = CGEvent::new(None) else {
+        tracing::warn!("failed to create zoom event");
+        return;
+    };
+    CGEvent::set_type(Some(&event), GESTURE);
+    CGEvent::set_integer_value_field(Some(&event), GESTURE_HID_TYPE, GESTURE_HID_TYPE_ZOOM);
+    CGEvent::set_integer_value_field(Some(&event), GESTURE_PHASE, phase as i64);
+    CGEvent::set_double_value_field(Some(&event), GESTURE_ZOOM_VALUE, magnification);
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+}
+
+/// Windows 版再做。
+#[cfg(not(target_os = "macos"))]
+fn post_zoom(_phase: ZoomPhase, _magnification: f64) {}
 
 /// 按下修饰键、点一下主键，再按相反顺序松开修饰键；中途出错也会松开已按下的修饰键。
 fn chord(enigo: &mut Enigo, modifiers: &[Key], key: Key) -> enigo::InputResult<()> {
