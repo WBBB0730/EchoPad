@@ -1,4 +1,4 @@
-//! 语音输入：把手机端的录音交给识别服务，再把每个定稿句整理后上屏或发回输入框（docs/prd/dictation.md）。
+//! 语音输入：把手机端的录音交给识别服务，松开后把全部定稿句整理一次再上屏（docs/prd/dictation.md）。
 
 mod bailian;
 mod cleanup;
@@ -31,8 +31,6 @@ pub enum AudioFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecognitionEvent {
-    /// 当前这句话的临时文字，可能还会被改写。
-    Interim(String),
     /// 识别服务确认不再改写的定稿句。
     Final(String),
     /// 最后一个定稿句之后，识别结束。
@@ -40,18 +38,17 @@ pub enum RecognitionEvent {
     Failed(String),
 }
 
-/// 对一个定稿句做整理（ADR-0006）。
+/// 对一次语音输入拼起来的全部定稿句做整理（ADR-0013）。
 pub trait Cleaner: Send + Sync + 'static {
-    /// `preceding` 是本次语音输入里已经整理好的文字，只作参考。
-    fn clean(&self, sentence: &str, preceding: &str) -> impl Future<Output = anyhow::Result<String>> + Send;
+    fn clean(&self, text: &str) -> impl Future<Output = anyhow::Result<String>> + Send;
 }
 
 /// 整理关闭时使用：定稿句原样使用。
 pub struct Verbatim;
 
 impl Cleaner for Verbatim {
-    async fn clean(&self, sentence: &str, _preceding: &str) -> anyhow::Result<String> {
-        Ok(sentence.to_owned())
+    async fn clean(&self, text: &str) -> anyhow::Result<String> {
+        Ok(text.to_owned())
     }
 }
 
@@ -91,7 +88,7 @@ impl Drop for DictationHandle {
     }
 }
 
-/// 用用户选择的云端识别服务和整理服务完成语音输入（ADR-0005、ADR-0006、ADR-0007）。
+/// 用用户选择的云端识别服务和整理服务完成语音输入（ADR-0005、ADR-0007、ADR-0013）。
 pub struct CloudDictation {
     recognition: RecognitionConfig,
     cleaner: Option<Arc<ChatCleaner>>,

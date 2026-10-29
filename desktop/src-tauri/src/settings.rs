@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, fs, io, path::PathBuf, sync::Mutex};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,10 +29,17 @@ pub struct RecognitionSettings {
 #[serde(rename_all = "camelCase")]
 pub struct CleanupSettings {
     pub enabled: bool,
+    #[serde(deserialize_with = "known_preset_or_default")]
     pub preset: CleanupPreset,
     /// 只有自定义预设使用，其他预设的地址是固定的。
     pub base_url: String,
     pub model: String,
+}
+
+/// 已经去掉的预设（例如本机 Ollama）读出来时换成默认预设，旧的设置文件照样能读。
+fn known_preset_or_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CleanupPreset, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(CleanupPreset::deserialize(value).unwrap_or_default())
 }
 
 impl Default for Settings {
@@ -44,9 +51,9 @@ impl Default for Settings {
             },
             cleanup: CleanupSettings {
                 enabled: true,
-                preset: CleanupPreset::Ark,
+                preset: CleanupPreset::default(),
                 base_url: String::new(),
-                model: CleanupPreset::Ark.default_model().to_owned(),
+                model: CleanupPreset::default().default_model().to_owned(),
             },
             keys: BTreeMap::new(),
         }
@@ -110,28 +117,29 @@ impl DoubaoResource {
 }
 
 /// 整理服务的预设，都兼容 OpenAI Chat Completions。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CleanupPreset {
+    #[default]
     Ark,
     Bailian,
     DeepSeek,
     OpenAi,
     OpenRouter,
-    Ollama,
     Custom,
 }
 
+/// 预设服务里可选的一个整理模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CleanupModel {
+    /// 请求里用的模型名。
+    pub id: &'static str,
+    /// 设置界面里显示的名称。
+    pub name: &'static str,
+}
+
 impl CleanupPreset {
-    pub const ALL: [Self; 7] = [
-        Self::Ark,
-        Self::Bailian,
-        Self::DeepSeek,
-        Self::OpenAi,
-        Self::OpenRouter,
-        Self::Ollama,
-        Self::Custom,
-    ];
+    pub const ALL: [Self; 6] = [Self::Ark, Self::Bailian, Self::DeepSeek, Self::OpenAi, Self::OpenRouter, Self::Custom];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -140,7 +148,6 @@ impl CleanupPreset {
             Self::DeepSeek => "DeepSeek",
             Self::OpenAi => "OpenAI",
             Self::OpenRouter => "OpenRouter",
-            Self::Ollama => "Ollama（本机）",
             Self::Custom => "自定义",
         }
     }
@@ -153,46 +160,60 @@ impl CleanupPreset {
             Self::DeepSeek => Some("https://api.deepseek.com"),
             Self::OpenAi => Some("https://api.openai.com/v1"),
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
-            Self::Ollama => Some("http://localhost:11434/v1"),
             Self::Custom => None,
         }
     }
 
-    /// 响应快的默认模型；为空时由用户填写。
-    pub fn default_model(self) -> &'static str {
+    /// 可选的模型，第一个是默认。都是响应快、能关闭深度思考的型号，用户只能从中选择（ADR-0007）；
+    /// 自定义地址由用户填写模型，列表为空。
+    pub fn models(self) -> &'static [CleanupModel] {
         match self {
-            Self::Ark => "doubao-seed-2-1-lite-260915",
-            Self::Bailian => "qwen3.8-flash",
-            Self::DeepSeek => "deepseek-v4-flash",
-            Self::OpenAi => "gpt-5.4-mini",
-            Self::OpenRouter | Self::Ollama | Self::Custom => "",
+            Self::Ark => &[
+                CleanupModel { id: "doubao-seed-2-0-mini-260428", name: "豆包 Seed 2.0 mini" },
+                CleanupModel { id: "deepseek-v4-1-flash-261017", name: "DeepSeek V4.1 Flash" },
+            ],
+            Self::Bailian => &[
+                CleanupModel { id: "qwen3.8-flash", name: "Qwen3.8 Flash" },
+                CleanupModel { id: "qwen3.7-flash", name: "Qwen3.7 Flash" },
+            ],
+            Self::DeepSeek => &[CleanupModel { id: "deepseek-flash", name: "DeepSeek V4.1 Flash" }],
+            Self::OpenAi => &[
+                CleanupModel { id: "gpt-6-luna", name: "GPT-6 Luna" },
+                CleanupModel { id: "gpt-5.4-mini", name: "GPT-5.4 mini" },
+            ],
+            Self::OpenRouter => &[
+                CleanupModel { id: "openai/gpt-6-luna", name: "GPT-6 Luna" },
+                CleanupModel { id: "google/gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite" },
+                CleanupModel { id: "qwen/qwen3.8-flash", name: "Qwen3.8 Flash" },
+            ],
+            Self::Custom => &[],
         }
     }
 
-    /// 关闭深度思考的请求参数。各家写法不同，而且只对已知支持的默认模型有效，
-    /// 所以只在使用默认模型时附加，用户换了模型就不附加，避免请求被拒。
-    pub fn extra_body(self, model: &str) -> Value {
-        if model != self.default_model() {
-            return json!({});
-        }
+    /// 默认模型；自定义地址为空，由用户填写。
+    pub fn default_model(self) -> &'static str {
+        self.models().first().map_or("", |model| model.id)
+    }
+
+    /// 关闭深度思考的请求参数，各家写法不同，列表里的模型都支持。自定义地址的模型未知，不附加。
+    pub fn extra_body(self) -> Value {
         match self {
             Self::Ark | Self::DeepSeek => json!({ "thinking": { "type": "disabled" } }),
             Self::Bailian => json!({ "enable_thinking": false }),
             Self::OpenAi => json!({ "reasoning_effort": "none" }),
-            Self::OpenRouter | Self::Ollama | Self::Custom => json!({}),
+            Self::OpenRouter => json!({ "reasoning": { "enabled": false } }),
+            Self::Custom => json!({}),
         }
     }
 
-    /// 本机的 Ollama 不需要密钥。
-    pub fn credential(self) -> Option<Credential> {
+    pub fn credential(self) -> Credential {
         match self {
-            Self::Ark => Some(Credential::VolcengineArk),
-            Self::Bailian => Some(Credential::DashScope),
-            Self::DeepSeek => Some(Credential::DeepSeek),
-            Self::OpenAi => Some(Credential::OpenAi),
-            Self::OpenRouter => Some(Credential::OpenRouter),
-            Self::Custom => Some(Credential::CustomCleanup),
-            Self::Ollama => None,
+            Self::Ark => Credential::VolcengineArk,
+            Self::Bailian => Credential::DashScope,
+            Self::DeepSeek => Credential::DeepSeek,
+            Self::OpenAi => Credential::OpenAi,
+            Self::OpenRouter => Credential::OpenRouter,
+            Self::Custom => Credential::CustomCleanup,
         }
     }
 }
@@ -219,7 +240,9 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub fn load(path: PathBuf) -> Result<Self> {
         let settings = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))?,
+            Ok(bytes) => serde_json::from_slice::<Settings>(&bytes)
+                .with_context(|| format!("failed to parse {}", path.display()))?
+                .with_listed_model(),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Settings::default(),
             Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
         };
@@ -234,7 +257,8 @@ impl SettingsStore {
     }
 
     /// 保存前去掉密钥两端的空白，并丢弃空的密钥。
-    pub fn save(&self, mut settings: Settings) -> Result<()> {
+    pub fn save(&self, settings: Settings) -> Result<()> {
+        let mut settings = settings.with_listed_model();
         settings.keys = settings
             .keys
             .into_iter()
@@ -284,7 +308,7 @@ pub enum RecognitionConfig {
 #[derive(Clone)]
 pub struct CleanupConfig {
     pub base_url: String,
-    pub api_key: Option<String>,
+    pub api_key: String,
     pub model: String,
     pub extra_body: Value,
 }
@@ -292,6 +316,15 @@ pub struct CleanupConfig {
 impl Settings {
     fn key(&self, credential: Credential) -> Option<String> {
         self.keys.get(&credential).map(|key| key.trim().to_owned()).filter(|key| !key.is_empty())
+    }
+
+    /// 预设的模型只能从列表里选：保存的模型不在列表里时（例如旧版本的默认模型），改用默认模型。
+    fn with_listed_model(mut self) -> Self {
+        let models = self.cleanup.preset.models();
+        if !models.is_empty() && !models.iter().any(|model| model.id == self.cleanup.model) {
+            self.cleanup.model = self.cleanup.preset.default_model().to_owned();
+        }
+        self
     }
 
     /// 缺少必需的密钥、地址或模型时返回 `None`，此时语音输入不可用。
@@ -310,15 +343,12 @@ impl Settings {
             let preset = self.cleanup.preset;
             let base_url = preset.base_url().unwrap_or(&self.cleanup.base_url).trim().to_owned();
             let model = self.cleanup.model.trim().to_owned();
-            let api_key = match preset.credential() {
-                Some(credential) => Some(self.key(credential)?),
-                None => None,
-            };
+            let api_key = self.key(preset.credential())?;
             if base_url.is_empty() || model.is_empty() {
                 return None;
             }
             Some(CleanupConfig {
-                extra_body: preset.extra_body(&model),
+                extra_body: preset.extra_body(),
                 base_url,
                 api_key,
                 model,
@@ -386,7 +416,8 @@ mod tests {
                 if api_key == "speech-key" && resource_id == "volc.seedasr.sauc.duration"
         ));
         let cleanup = config.cleanup.unwrap();
-        assert_eq!(cleanup.api_key.as_deref(), Some("ark-key"));
+        assert_eq!(cleanup.api_key, "ark-key");
+        assert_eq!(cleanup.model, "doubao-seed-2-0-mini-260428");
         assert_eq!(cleanup.extra_body, json!({ "thinking": { "type": "disabled" } }));
     }
 
@@ -406,23 +437,54 @@ mod tests {
 
         let config = settings.dictation_config().unwrap();
         assert!(matches!(config.recognition, RecognitionConfig::Bailian { ref api_key } if api_key == "dashscope-key"));
-        assert_eq!(config.cleanup.unwrap().api_key.as_deref(), Some("dashscope-key"));
+        assert_eq!(config.cleanup.unwrap().api_key, "dashscope-key");
     }
 
     #[test]
-    fn local_ollama_needs_no_key_and_custom_models_skip_vendor_parameters() {
-        let mut settings = with_keys(&[(Credential::VolcengineSpeech, "speech-key")]);
-        settings.cleanup.preset = CleanupPreset::Ollama;
-        settings.cleanup.model = "qwen3".into();
-        let cleanup = settings.dictation_config().unwrap().cleanup.unwrap();
-        assert_eq!(cleanup.base_url, "http://localhost:11434/v1");
-        assert!(cleanup.api_key.is_none());
-        assert_eq!(cleanup.extra_body, json!({}));
+    fn every_preset_offers_listed_models_except_the_custom_address() {
+        for preset in CleanupPreset::ALL {
+            let models = preset.models();
+            assert_eq!(models.is_empty(), preset == CleanupPreset::Custom, "{preset:?}");
+            assert_eq!(preset.default_model(), models.first().map_or("", |model| model.id));
+        }
+    }
 
-        settings.cleanup.preset = CleanupPreset::Ark;
-        settings.cleanup.model = "some-other-model".into();
-        settings.keys.insert(Credential::VolcengineArk, "ark-key".into());
+    #[test]
+    fn custom_address_uses_the_typed_model_without_vendor_parameters() {
+        let mut settings = with_keys(&[(Credential::VolcengineSpeech, "speech-key"), (Credential::CustomCleanup, "key")]);
+        settings.cleanup.preset = CleanupPreset::Custom;
+        settings.cleanup.base_url = "https://llm.example.com/v1".into();
+        settings.cleanup.model = "my-model".into();
+
         let cleanup = settings.dictation_config().unwrap().cleanup.unwrap();
+        assert_eq!(cleanup.base_url, "https://llm.example.com/v1");
+        assert_eq!(cleanup.model, "my-model");
         assert_eq!(cleanup.extra_body, json!({}));
+    }
+
+    #[test]
+    fn settings_from_older_versions_switch_to_a_listed_model() {
+        let load = |cleanup: Value| {
+            let path = temp_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = json!({
+                "recognition": { "service": "doubao", "doubaoResource": "seed2Duration" },
+                "cleanup": cleanup,
+            });
+            fs::write(&path, file.to_string()).unwrap();
+            SettingsStore::load(path).unwrap().get().cleanup
+        };
+
+        // 旧版本的默认模型已经不在列表里。
+        let cleanup = load(json!({ "enabled": true, "preset": "ark", "baseUrl": "", "model": "doubao-seed-2-1-lite-260915" }));
+        assert_eq!(cleanup.model, "doubao-seed-2-0-mini-260428");
+
+        // 本机 Ollama 已经去掉。
+        let cleanup = load(json!({ "enabled": true, "preset": "ollama", "baseUrl": "", "model": "qwen3" }));
+        assert_eq!((cleanup.preset, cleanup.model.as_str()), (CleanupPreset::Ark, "doubao-seed-2-0-mini-260428"));
+
+        // 自定义地址的模型由用户填写，保持不变。
+        let cleanup = load(json!({ "enabled": true, "preset": "custom", "baseUrl": "https://llm.example.com/v1", "model": "my-model" }));
+        assert_eq!(cleanup.model, "my-model");
     }
 }

@@ -1,7 +1,8 @@
 package com.wbbb.echopad.mobile.touchpad
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -123,7 +124,7 @@ fun TouchpadScreen(
     val mediaToggle = @Composable { PanelToggle("媒体", open = panel == Panel.Media) { togglePanel(Panel.Media) } }
     val keyboardToggle = @Composable { PanelToggle("键盘", open = panel == Panel.Keyboard) { togglePanel(Panel.Keyboard) } }
     val talkButton = @Composable { modifier: Modifier -> TalkButton(dictation, connected, onNotice, modifier) }
-    val bottomArea = @Composable { modifier: Modifier -> BottomArea(dictation, keyboard, panel, connected, modifier) }
+    val bottomArea = @Composable { modifier: Modifier -> BottomArea(keyboard, panel, connected, modifier) }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         // 按整个页面的宽高判断横竖屏；弹出手机键盘只缩小下面这一层。
@@ -189,24 +190,21 @@ fun TouchpadScreen(
     }
 }
 
-/** 临时文字或组字，以及展开的面板。都没有时不占位置。 */
+/** 组字以及展开的面板。都没有时不占位置。 */
 @Composable
 private fun BottomArea(
-    dictation: DictationController,
     keyboard: KeyboardInput,
     panel: Panel?,
     connected: Boolean,
     modifier: Modifier,
 ) {
-    val interimText by dictation.interimText.collectAsStateWithLifecycle()
     val composing by keyboard.composing.collectAsStateWithLifecycle()
-    val liveText = interimText.ifEmpty { composing }
-    if (liveText.isEmpty() && panel == null) return
+    if (composing.isEmpty() && panel == null) return
 
     Column(modifier.fillMaxWidth().padding(top = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (liveText.isNotEmpty()) {
+        if (composing.isNotEmpty()) {
             Text(
-                liveText,
+                composing,
                 color = EchoPadColors.Text,
                 style = MaterialTheme.typography.bodyLarge,
                 textAlign = TextAlign.Center,
@@ -373,33 +371,58 @@ private fun TalkButton(
     val audio = rememberAudioCapture()
     val haptics = LocalHapticFeedback.current
     val speaking by dictation.speaking.collectAsStateWithLifecycle()
+    // 按住时手指滑到按钮上边缘以外：这时松手就取消（DESIGN.md）。
+    var cancelling by remember { mutableStateOf(false) }
 
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(28.dp))
-            .background(if (speaking) EchoPadColors.Text else EchoPadColors.SurfaceRaised)
+            .background(
+                when {
+                    speaking && cancelling -> EchoPadColors.Cancel
+                    speaking -> EchoPadColors.Text
+                    else -> EchoPadColors.SurfaceRaised
+                },
+            )
             .pointerInput(enabled, audio) {
-                detectTapGestures(
-                    onPress = {
-                        if (!enabled) return@detectTapGestures
-                        if (!audio.hasPermission) {
-                            audio.requestPermission { granted ->
-                                if (!granted) onNotice("需要麦克风权限才能语音输入")
-                            }
-                            return@detectTapGestures
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    if (!enabled) return@awaitEachGesture
+                    if (!audio.hasPermission) {
+                        audio.requestPermission { granted ->
+                            if (!granted) onNotice("需要麦克风权限才能语音输入")
                         }
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        dictation.start(audio.record())
-                        tryAwaitRelease()
-                        dictation.stop()
-                    },
-                )
+                        return@awaitEachGesture
+                    }
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    dictation.start(audio.record())
+                    try {
+                        // 手指移出按钮后仍然会收到它的事件，位置相对按钮，上边缘以上为负。
+                        while (true) {
+                            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) break
+                            val above = change.position.y < 0f
+                            if (above != cancelling) {
+                                cancelling = above
+                                if (above) haptics.performHapticFeedback(HapticFeedbackType.GestureThresholdActivate)
+                            }
+                        }
+                    } finally {
+                        if (cancelling) dictation.cancel() else dictation.stop()
+                        cancelling = false
+                    }
+                }
             },
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            if (speaking) "松开结束" else "按住说话",
+            when {
+                speaking && cancelling -> "松开取消"
+                speaking -> "松开结束"
+                else -> "按住说话"
+            },
             color = when {
+                speaking && cancelling -> EchoPadColors.Text
                 speaking -> EchoPadColors.Background
                 enabled -> EchoPadColors.Text
                 else -> EchoPadColors.TextMuted

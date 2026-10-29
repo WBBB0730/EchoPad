@@ -313,6 +313,10 @@ fn dispatch(
                 handle.finish();
             }
         }
+        // 丢弃进行中的语音输入：识别和整理都停下，什么都不上屏。
+        Body::DictationCancel(cancel) => {
+            dictations.remove(&cancel.session_id);
+        }
         Body::TypeText(typed) => {
             if !typed.text.is_empty() {
                 context.input.send(InputCommand::Text(typed.text));
@@ -387,7 +391,7 @@ mod tests {
     use crate::{
         dictation::{AudioFrame, Cleaner, Outbound, RecognitionEvent, run_pipeline},
         protocol::{
-            AudioChunk, ButtonAction, DictationStart, DictationStop, KeyPress, PointerMove, ShortcutAction,
+            AudioChunk, ButtonAction, DictationCancel, DictationStart, DictationStop, KeyPress, PointerMove, ShortcutAction,
             TypeText, Zoom,
         },
     };
@@ -412,8 +416,8 @@ mod tests {
     struct UppercaseCleaner;
 
     impl Cleaner for UppercaseCleaner {
-        async fn clean(&self, sentence: &str, _preceding: &str) -> anyhow::Result<String> {
-            Ok(sentence.to_uppercase())
+        async fn clean(&self, text: &str) -> anyhow::Result<String> {
+            Ok(text.to_uppercase())
         }
     }
 
@@ -621,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dictation_commits_cleaned_sentences() {
+    async fn dictation_commits_the_cleaned_text() {
         let harness = start_server(Some(Arc::new(ScriptedDictation))).await;
         let mut client = paired_client(&harness).await;
 
@@ -629,10 +633,28 @@ mod tests {
         send(&mut client, client_message::Body::AudioChunk(AudioChunk { session_id: 1, pcm: vec![0; 3200] })).await;
         send(&mut client, client_message::Body::DictationStop(DictationStop { session_id: 1 })).await;
 
-        let committed = receive(&mut client).await;
-        assert!(matches!(&committed, server_message::Body::CommittedText(text) if text.text == "GOT 3200 BYTES"));
-        assert!(matches!(receive(&mut client).await, server_message::Body::DictationFinished(_)));
+        assert!(matches!(
+            receive(&mut client).await,
+            server_message::Body::DictationFinished(finished) if finished.cleanup_failure.is_empty()
+        ));
         assert!(harness.input.commands().contains(&InputCommand::Text("GOT 3200 BYTES".into())));
+    }
+
+    #[tokio::test]
+    async fn cancelled_dictation_commits_nothing() {
+        let harness = start_server(Some(Arc::new(ScriptedDictation))).await;
+        let mut client = paired_client(&harness).await;
+
+        send(&mut client, client_message::Body::DictationStart(DictationStart { session_id: 1 })).await;
+        send(&mut client, client_message::Body::AudioChunk(AudioChunk { session_id: 1, pcm: vec![0; 3200] })).await;
+        send(&mut client, client_message::Body::DictationCancel(DictationCancel { session_id: 1 })).await;
+        // 取消之后再松开也不会上屏：这次语音输入已经被丢弃了。
+        send(&mut client, client_message::Body::DictationStop(DictationStop { session_id: 1 })).await;
+        client.close(None).await.unwrap();
+        harness.wait_for_release_all().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!harness.input.commands().iter().any(|command| matches!(command, InputCommand::Text(_))));
     }
 
     #[tokio::test]

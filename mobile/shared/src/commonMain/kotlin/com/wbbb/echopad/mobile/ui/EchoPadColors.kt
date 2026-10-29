@@ -10,4 +10,7 @@ object EchoPadColors {
     val TextMuted = Color(0xFFA1A1A1)
     val Connected = Color(0xFF16A34A)
     val Connecting = Color(0xFFF59E0B)
+
+    /** 上滑取消语音输入时的说话按钮。 */
+    val Cancel = Color(0xFFDC2626)
 }

@@ -23,8 +23,9 @@ type Preset = {
   id: string;
   name: string;
   baseUrl: string | null;
-  defaultModel: string;
-  credential: Credential | null;
+  /** 可选的模型，第一个是默认；为空时由用户填写。 */
+  models: { id: string; name: string }[];
+  credential: Credential;
 };
 
 type SettingsView = {
@@ -67,7 +68,7 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
     const next = view?.cleanupPresets.find((item) => item.id === id);
     update((draft) => {
       draft.cleanup.preset = id;
-      draft.cleanup.model = next?.defaultModel ?? "";
+      draft.cleanup.model = next?.models[0]?.id ?? "";
     });
   }
 
@@ -156,12 +157,20 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
                 </Field>
               )}
               <Field label="模型">
-                <Input
-                  className="text-sm"
-                  placeholder={preset?.defaultModel || "模型名称"}
-                  value={settings.cleanup.model}
-                  onChange={(event) => update((draft) => (draft.cleanup.model = event.target.value))}
-                />
+                {preset && preset.models.length > 0 ? (
+                  <ChoiceSelect
+                    items={preset.models}
+                    value={settings.cleanup.model}
+                    onChange={(model) => update((draft) => (draft.cleanup.model = model))}
+                  />
+                ) : (
+                  <Input
+                    className="text-sm"
+                    placeholder="模型名称"
+                    value={settings.cleanup.model}
+                    onChange={(event) => update((draft) => (draft.cleanup.model = event.target.value))}
+                  />
+                )}
               </Field>
               {keyField(preset?.credential ?? null)}
             </CardContent>

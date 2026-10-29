@@ -128,11 +128,10 @@ fn request_payload(context: Option<&str>) -> Value {
     })
 }
 
-/// 从全量返回的分句列表里找出新出现的定稿句，其余的拼成临时文字。
+/// 从全量返回的分句列表里找出新出现的定稿句。
 #[derive(Default)]
 struct UtteranceTracker {
     finalized: usize,
-    interim: String,
 }
 
 impl UtteranceTracker {
@@ -140,8 +139,6 @@ impl UtteranceTracker {
         let Some(utterances) = payload.pointer("/result/utterances").and_then(Value::as_array) else {
             return Vec::new();
         };
-        let text = |utterance: &Value| utterance["text"].as_str().unwrap_or_default().to_owned();
-
         let mut events = Vec::new();
         for utterance in &utterances[self.finalized.min(utterances.len())..] {
             // 最后一包之后不会再有二遍结果，剩下的分句也一并定稿。
@@ -149,16 +146,10 @@ impl UtteranceTracker {
                 break;
             }
             self.finalized += 1;
-            let sentence = text(utterance);
+            let sentence = utterance["text"].as_str().unwrap_or_default();
             if !sentence.trim().is_empty() {
-                events.push(RecognitionEvent::Final(sentence));
+                events.push(RecognitionEvent::Final(sentence.to_owned()));
             }
-        }
-
-        let interim: String = utterances.iter().skip(self.finalized).map(text).collect();
-        if interim != self.interim {
-            self.interim.clone_from(&interim);
-            events.push(RecognitionEvent::Interim(interim));
         }
         events
     }
@@ -345,7 +336,7 @@ mod tests {
         let mut tracker = UtteranceTracker::default();
 
         let events = tracker.update(&payload(json!([{ "text": "今天天", "definite": false }])), false);
-        assert_eq!(events, [RecognitionEvent::Interim("今天天".into())]);
+        assert!(events.is_empty());
 
         let events = tracker.update(
             &payload(json!([
@@ -354,10 +345,7 @@ mod tests {
             ])),
             false,
         );
-        assert_eq!(
-            events,
-            [RecognitionEvent::Final("今天天气不错。".into()), RecognitionEvent::Interim("我们".into())]
-        );
+        assert_eq!(events, [RecognitionEvent::Final("今天天气不错。".into())]);
 
         let events = tracker.update(
             &payload(json!([
@@ -366,10 +354,7 @@ mod tests {
             ])),
             true,
         );
-        assert_eq!(
-            events,
-            [RecognitionEvent::Final("我们出去走走。".into()), RecognitionEvent::Interim(String::new())]
-        );
+        assert_eq!(events, [RecognitionEvent::Final("我们出去走走。".into())]);
     }
 
     #[test]

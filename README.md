@@ -36,7 +36,6 @@ pnpm tauri dev
 | 阿里百炼（识别、整理） | [获取与配置 API Key](https://docs.bailian.console.aliyun.com/zh/model-studio/get-api-key)，地域选华北 2（北京），识别和整理共用同一个 Key |
 | 火山方舟（整理） | [获取 API Key](https://ark.volcengine.com/region:cn-beijing/docs/api-key)，并在"开通管理"里开通所用的模型；与豆包语音的 Key 不通用 |
 | DeepSeek、OpenAI、OpenRouter（整理） | 各自控制台的 API Key 页面 |
-| Ollama（整理） | 本机运行，不需要 Key |
 
 测试：
 

@@ -20,6 +20,7 @@ message ClientMessage {
     KeyPress key_press = 9;
     ShortcutAction shortcut_action = 10;
     Zoom zoom = 11;
+    DictationCancel dictation_cancel = 12;
   }
 }
 
@@ -95,6 +96,11 @@ message DictationStop {
   uint32 session_id = 1;
 }
 
+// 用户上滑取消：丢弃这次语音输入的全部内容，什么都不上屏。
+message DictationCancel {
+  uint32 session_id = 1;
+}
+
 // 在手机键盘上选定的文字，输入到电脑的插入点。
 message TypeText {
   string text = 1;
@@ -148,11 +154,12 @@ message ServerMessage {
   oneof body {
     Welcome welcome = 1;
     Rejected rejected = 2;
-    InterimText interim_text = 3;
-    CommittedText committed_text = 4;
     DictationFinished dictation_finished = 5;
     DictationFailed dictation_failed = 6;
   }
+  // 曾用于在手机端显示识别中的文字和逐句上屏的文字，已去掉（ADR-0013）。
+  reserved 3, 4;
+  reserved "interim_text", "committed_text";
   // 曾用于先编辑模式，已去掉。
   reserved 7;
   reserved "compose_text";
@@ -173,18 +180,11 @@ message Rejected {
   Reason reason = 1;
 }
 
-message InterimText {
-  uint32 session_id = 1;
-  string text = 2;
-}
-
-message CommittedText {
-  uint32 session_id = 1;
-  string text = 2;
-}
-
+// 这次语音输入已经结束，整理好的文字已经上屏。
 message DictationFinished {
   uint32 session_id = 1;
+  // 整理失败时的原因，这时上屏的是识别原文。整理成功或整理关闭时为空。
+  string cleanup_failure = 2;
 }
 
 message DictationFailed {

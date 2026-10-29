@@ -1,4 +1,4 @@
-//! 识别事件 → 整理 → 上屏。定稿句按顺序整理，整理完立即上屏（ADR-0006）。
+//! 识别事件 → 整理 → 上屏。松开后把全部定稿句拼成一段整理一次，整理好一次上屏（ADR-0013）。
 
 use std::sync::Arc;
 
@@ -7,13 +7,8 @@ use tokio::sync::mpsc;
 use super::{Cleaner, Outbound, RecognitionEvent};
 use crate::{
     input::{InputCommand, InputSink},
-    protocol::{
-        CommittedText, DictationFailed, DictationFinished, InterimText, ServerMessage, server_message::Body,
-    },
+    protocol::{DictationFailed, DictationFinished, ServerMessage, server_message::Body},
 };
-
-/// 整理时作为参考的前文最多保留这么多字。
-const PRECEDING_CONTEXT_CHARS: usize = 200;
 
 pub async fn run<C: Cleaner>(
     session_id: u32,
@@ -22,21 +17,13 @@ pub async fn run<C: Cleaner>(
     input: Arc<dyn InputSink>,
     outbound: Outbound,
 ) {
-    let (sentences, queue) = mpsc::unbounded_channel();
-    let committer = tokio::spawn(commit_sentences(session_id, queue, cleaner, input, outbound.clone()));
-
+    let mut recognized = String::new();
     let mut failure = None;
-    let mut last_interim = String::new();
     while let Some(event) = events.recv().await {
         match event {
-            RecognitionEvent::Interim(text) => {
-                if text != last_interim {
-                    send(&outbound, Body::InterimText(InterimText { session_id, text: text.clone() }));
-                    last_interim = text;
-                }
-            }
             RecognitionEvent::Final(sentence) => {
-                let _ = sentences.send(sentence);
+                recognized.push_str(separator(&recognized, &sentence));
+                recognized.push_str(&sentence);
             }
             RecognitionEvent::Finished => break,
             RecognitionEvent::Failed(message) => {
@@ -46,50 +33,42 @@ pub async fn run<C: Cleaner>(
         }
     }
 
-    // 已经定稿的句子照常整理，然后再告诉手机端结束。
-    drop(sentences);
-    let _ = committer.await;
-    send(
-        &outbound,
-        match failure {
-            Some(message) => Body::DictationFailed(DictationFailed { session_id, message }),
-            None => Body::DictationFinished(DictationFinished { session_id }),
-        },
-    );
+    // 识别出错时，已经定稿的句子照常整理上屏，然后再告诉手机端出错。
+    let cleanup_failure = commit(&recognized, cleaner.as_ref(), input.as_ref()).await;
+    let body = match failure {
+        Some(message) => Body::DictationFailed(DictationFailed { session_id, message }),
+        None => Body::DictationFinished(DictationFinished {
+            session_id,
+            cleanup_failure: cleanup_failure.unwrap_or_default(),
+        }),
+    };
+    let _ = outbound.send(ServerMessage { body: Some(body) });
 }
 
-async fn commit_sentences<C: Cleaner>(
-    session_id: u32,
-    mut queue: mpsc::UnboundedReceiver<String>,
-    cleaner: Arc<C>,
-    input: Arc<dyn InputSink>,
-    outbound: Outbound,
-) {
-    let mut committed = String::new();
-    while let Some(sentence) = queue.recv().await {
-        let cleaned = match cleaner.clean(&sentence, tail(&committed, PRECEDING_CONTEXT_CHARS)).await {
-            Ok(cleaned) => cleaned,
-            Err(err) => {
-                // 整理失败时使用识别原文，不丢掉用户说的话。
-                tracing::warn!("cleanup failed, using the recognized sentence: {err:#}");
-                sentence
-            }
-        };
-        let cleaned = cleaned.trim();
-        // 整句都是口头禅时，整理结果为空，什么都不做。
-        if cleaned.is_empty() {
-            continue;
-        }
-        let text = format!("{}{cleaned}", separator(&committed, cleaned));
-        input.send(InputCommand::Text(text.clone()));
-        send(&outbound, Body::CommittedText(CommittedText { session_id, text: cleaned.to_owned() }));
-        committed.push_str(&text);
+/// 整理并上屏，返回整理失败的原因。
+async fn commit<C: Cleaner>(recognized: &str, cleaner: &C, input: &dyn InputSink) -> Option<String> {
+    if recognized.is_empty() {
+        return None;
     }
+    let (text, failure) = match cleaner.clean(recognized).await {
+        Ok(cleaned) => (cleaned, None),
+        Err(err) => {
+            // 整理失败时使用识别原文，不丢掉用户说的话。
+            tracing::warn!("cleanup failed, using the recognized text: {err:#}");
+            (recognized.to_owned(), Some(format!("{err:#}")))
+        }
+    };
+    // 整段都是口头禅时，整理结果为空，什么都不上屏。
+    let text = text.trim();
+    if !text.is_empty() {
+        input.send(InputCommand::Text(text.to_owned()));
+    }
+    failure
 }
 
 /// 英文句子之间补一个空格，中文不需要。
-fn separator(committed: &str, next: &str) -> &'static str {
-    match (committed.chars().last(), next.chars().next()) {
+fn separator(recognized: &str, next: &str) -> &'static str {
+    match (recognized.chars().last(), next.chars().next()) {
         (Some(last), Some(first))
             if (last.is_ascii_alphanumeric() || ".,!?;:".contains(last)) && first.is_ascii_alphanumeric() =>
         {
@@ -99,30 +78,21 @@ fn separator(committed: &str, next: &str) -> &'static str {
     }
 }
 
-fn tail(text: &str, max_chars: usize) -> &str {
-    let skip = text.chars().count().saturating_sub(max_chars);
-    text.char_indices().nth(skip).map_or("", |(index, _)| &text[index..])
-}
-
-fn send(outbound: &Outbound, body: Body) {
-    let _ = outbound.send(ServerMessage { body: Some(body) });
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::*;
 
-    /// 把每句话包上方括号，便于断言整理确实发生了。
+    /// 把整段包上方括号，便于断言整理确实发生了、而且只发生了一次。
     struct BracketCleaner;
 
     impl Cleaner for BracketCleaner {
-        async fn clean(&self, sentence: &str, _preceding: &str) -> anyhow::Result<String> {
-            Ok(match sentence {
+        async fn clean(&self, text: &str) -> anyhow::Result<String> {
+            Ok(match text {
                 "嗯嗯" => String::new(),
                 "fail" => anyhow::bail!("cleanup service unavailable"),
-                _ => format!("[{sentence}]"),
+                _ => format!("[{text}]"),
             })
         }
     }
@@ -166,39 +136,40 @@ mod tests {
         (input, bodies)
     }
 
-    #[tokio::test]
-    async fn only_cleaned_final_sentences_are_committed_in_order() {
-        let (input, bodies) = run_events(vec![
-            RecognitionEvent::Interim("今天".into()),
-            RecognitionEvent::Final("今天天气不错".into()),
-            RecognitionEvent::Interim("我们".into()),
-            RecognitionEvent::Final("我们出去走走".into()),
-            RecognitionEvent::Finished,
-        ])
-        .await;
-
-        assert_eq!(input.texts(), ["[今天天气不错]", "[我们出去走走]"]);
-        let interims: Vec<_> = bodies
-            .iter()
-            .filter_map(|body| match body {
-                Body::InterimText(interim) => Some(interim.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(interims, ["今天", "我们"]);
-        assert!(matches!(bodies.last(), Some(Body::DictationFinished(DictationFinished { session_id: 7 }))));
+    fn finished(cleanup_failure: &str) -> Body {
+        Body::DictationFinished(DictationFinished { session_id: 7, cleanup_failure: cleanup_failure.into() })
     }
 
     #[tokio::test]
-    async fn filler_only_sentences_are_skipped_and_failed_cleanup_keeps_the_original() {
-        let (input, _) = run_events(vec![
-            RecognitionEvent::Final("嗯嗯".into()),
-            RecognitionEvent::Final("fail".into()),
+    async fn all_final_sentences_are_cleaned_once_and_committed_together() {
+        let (input, bodies) = run_events(vec![
+            RecognitionEvent::Final("明天上午9点开会。".into()),
+            RecognitionEvent::Final("不对，是下午3点。".into()),
             RecognitionEvent::Finished,
         ])
         .await;
 
+        assert_eq!(input.texts(), ["[明天上午9点开会。不对，是下午3点。]"]);
+        assert_eq!(bodies, [finished("")]);
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_commits_the_recognized_text_and_reports_why() {
+        let (input, bodies) = run_events(vec![RecognitionEvent::Final("fail".into()), RecognitionEvent::Finished]).await;
+
         assert_eq!(input.texts(), ["fail"]);
+        assert_eq!(bodies, [finished("cleanup service unavailable")]);
+    }
+
+    #[tokio::test]
+    async fn filler_only_or_silent_dictation_commits_nothing() {
+        let (input, bodies) = run_events(vec![RecognitionEvent::Final("嗯嗯".into()), RecognitionEvent::Finished]).await;
+        assert!(input.texts().is_empty());
+        assert_eq!(bodies, [finished("")]);
+
+        let (input, bodies) = run_events(vec![RecognitionEvent::Finished]).await;
+        assert!(input.texts().is_empty(), "nothing recognized, nothing to clean");
+        assert_eq!(bodies, [finished("")]);
     }
 
     #[tokio::test]
@@ -213,17 +184,23 @@ mod tests {
         assert!(matches!(bodies.last(), Some(Body::DictationFailed(failed)) if failed.message == "识别失败"));
     }
 
+    #[tokio::test]
+    async fn english_sentences_are_joined_with_a_space() {
+        let (input, _) = run_events(vec![
+            RecognitionEvent::Final("Hello world.".into()),
+            RecognitionEvent::Final("Next one".into()),
+            RecognitionEvent::Finished,
+        ])
+        .await;
+
+        assert_eq!(input.texts(), ["[Hello world. Next one]"]);
+    }
+
     #[test]
-    fn english_sentences_are_separated_by_a_space() {
+    fn only_english_sentences_need_a_separator() {
         assert_eq!(separator("", "Hello"), "");
         assert_eq!(separator("Hello world.", "Next"), " ");
         assert_eq!(separator("你好。", "下一句"), "");
         assert_eq!(separator("你好。", "Next"), "");
-    }
-
-    #[test]
-    fn tail_keeps_the_last_characters() {
-        assert_eq!(tail("一二三四五", 3), "三四五");
-        assert_eq!(tail("短", 3), "短");
     }
 }

@@ -27,7 +27,7 @@ use crate::{
     input::InputController,
     pairing::{PairingStore, pairing_link},
     server::{PORT, ServerContext},
-    settings::{CleanupPreset, Credential, DoubaoResource, RecognitionService, Settings, SettingsStore},
+    settings::{CleanupModel, CleanupPreset, Credential, DoubaoResource, RecognitionService, Settings, SettingsStore},
     status::{Status, StatusHub},
 };
 
@@ -67,7 +67,7 @@ impl AppState {
                     id: preset,
                     name: preset.name(),
                     base_url: preset.base_url(),
-                    default_model: preset.default_model(),
+                    models: preset.models(),
                     credential: preset.credential(),
                 })
                 .to_vec(),
@@ -99,8 +99,9 @@ struct PresetView {
     id: CleanupPreset,
     name: &'static str,
     base_url: Option<&'static str>,
-    default_model: &'static str,
-    credential: Option<Credential>,
+    /// 可选的模型，第一个是默认；为空时由用户填写。
+    models: &'static [CleanupModel],
+    credential: Credential,
 }
 
 #[tauri::command]

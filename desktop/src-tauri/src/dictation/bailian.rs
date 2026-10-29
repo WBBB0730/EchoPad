@@ -75,13 +75,8 @@ async fn run(
             },
             event = next_event(&mut reader) => match event? {
                 ServerEvent::Result { text, sentence_end } => {
-                    if sentence_end {
-                        if !text.trim().is_empty() {
-                            let _ = events.send(RecognitionEvent::Final(text));
-                        }
-                        let _ = events.send(RecognitionEvent::Interim(String::new()));
-                    } else {
-                        let _ = events.send(RecognitionEvent::Interim(text));
+                    if sentence_end && !text.trim().is_empty() {
+                        let _ = events.send(RecognitionEvent::Final(text));
                     }
                 }
                 ServerEvent::Finished => {
