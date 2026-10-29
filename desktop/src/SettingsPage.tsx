@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import type { UpdateStatus } from "./update";
 
 type Credential =
   "volcengineSpeech" | "volcengineArk" | "dashScope" | "deepSeek" | "openAi" | "openRouter" | "customCleanup";
@@ -35,7 +36,16 @@ type SettingsView = {
   cleanupPresets: Preset[];
 };
 
-export function SettingsPage({ onClose }: { onClose: () => void }) {
+export function SettingsPage({
+  updateStatus,
+  onUpdate,
+  onClose,
+}: {
+  updateStatus: UpdateStatus;
+  /** 打开更新弹窗 */
+  onUpdate: () => void;
+  onClose: () => void;
+}) {
   const [view, setView] = useState<SettingsView | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
@@ -46,6 +56,8 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
       setView(next);
       setSettings(next.settings);
     });
+    // 打开设置时检查更新，距上次检查不足 5 分钟就跳过
+    invoke("check_for_updates", { force: false });
   }, []);
 
   if (!view || !settings) {
@@ -176,6 +188,8 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
             </CardContent>
           )}
         </Card>
+
+        <AboutCard status={updateStatus} onUpdate={onUpdate} />
       </div>
 
       <footer className="flex flex-col gap-2 border-t p-4">
@@ -185,6 +199,32 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
         </Button>
       </footer>
     </main>
+  );
+}
+
+/** 版本号与检查更新。已有可以安装的更新时按钮写"立即更新"；检查或下载期间只置灰，不换文字。 */
+function AboutCard({ status, onUpdate }: { status: UpdateStatus; onUpdate: () => void }) {
+  const busy = status.phase === "checking" || status.phase === "downloading";
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>关于</CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-sm text-muted-foreground">版本 {status.currentVersion}</span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={status.prompt ? onUpdate : () => invoke("check_for_updates", { force: true })}
+          >
+            {status.prompt ? "立即更新" : "检查更新"}
+          </Button>
+        </div>
+        {status.phase === "failed" && <p className="text-sm text-destructive">更新失败，请重试</p>}
+      </CardContent>
+    </Card>
   );
 }
 

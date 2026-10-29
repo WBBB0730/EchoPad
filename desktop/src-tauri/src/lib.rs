@@ -8,6 +8,7 @@ mod screen_context;
 mod server;
 mod settings;
 mod status;
+mod update;
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -34,6 +35,7 @@ use crate::{
     server::{PORT, ServerContext},
     settings::{CleanupModel, CleanupPreset, Credential, DoubaoResource, RecognitionService, Settings, SettingsStore},
     status::{PhoneStatus, Status, StatusHub},
+    update::{UpdateStatus, Updater},
 };
 
 /// 菜单栏图标的标识，手机端在线状态变化时据此更新右键菜单。
@@ -143,6 +145,24 @@ fn open_accessibility_settings(app: AppHandle) -> Result<(), String> {
     app.opener().open_url(ACCESSIBILITY_SETTINGS_URL, None::<&str>).map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+fn get_update_status(updater: tauri::State<'_, Arc<Updater>>) -> UpdateStatus {
+    updater.status()
+}
+
+/// 打开设置时 `force` 为 false，距上次检查不足 5 分钟就跳过；手动检查为 true。
+#[tauri::command]
+async fn check_for_updates(updater: tauri::State<'_, Arc<Updater>>, force: bool) -> Result<UpdateStatus, String> {
+    updater.check(force).await;
+    Ok(updater.status())
+}
+
+/// 更新弹窗里的确认：安装并重启；开发版打开 Release 页面。
+#[tauri::command]
+fn apply_update(updater: tauri::State<'_, Arc<Updater>>) -> Result<(), String> {
+    updater.apply()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -151,8 +171,13 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             build_tray(app)?;
+
+            let updater = Arc::new(Updater::new(app.handle().clone()));
+            updater.clone().start();
+            app.manage(updater);
 
             let (state, tls) = build_state(app.handle())?;
             state.apply_settings();
@@ -198,7 +223,10 @@ pub fn run() {
             get_settings,
             save_settings,
             unpair_phone,
-            open_accessibility_settings
+            open_accessibility_settings,
+            get_update_status,
+            check_for_updates,
+            apply_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -224,7 +252,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                app.state::<Arc<Updater>>().install_on_quit();
+                app.exit(0);
+            }
             id => {
                 if let Some(phone_id) = id.strip_prefix(SWITCH_MENU_PREFIX) {
                     app.state::<AppState>().server.request_switch(phone_id);

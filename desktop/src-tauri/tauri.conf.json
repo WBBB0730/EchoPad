@@ -31,5 +31,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI4MThGNjE0MUJGNUE2QkUKUldTK3B2VWJGUFlZdU9mM0pTbnRwSmtMdDM3c29aaE9RQzhEOVk3OG9TSHhja0RHMjNJZ3lRRGEK",
+      "endpoints": ["https://github.com/WBBB0730/EchoPad/releases/latest/download/latest.json"]
+    }
   }
 }

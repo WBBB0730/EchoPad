@@ -5,6 +5,8 @@ import { ChevronLeftIcon, PlusIcon, SettingsIcon, SmartphoneIcon } from "lucide-
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { SettingsPage } from "./SettingsPage";
+import { UpdateDialog } from "./UpdateDialog";
+import { useUpdateStatus } from "./update";
 
 type Phone = { id: string; name: string; online: boolean };
 
@@ -29,6 +31,8 @@ function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [page, setPage] = useState<"status" | "settings" | "pairing">("status");
   const pairedCount = useRef(0);
+  const update = useUpdateStatus();
+  const [updateOpen, setUpdateOpen] = useState(false);
 
   useEffect(() => {
     const unlisten = listen<Status>("status-changed", (event) => setStatus(event.payload));
@@ -47,12 +51,19 @@ function App() {
     pairedCount.current = count;
   }, [status?.phones.length, page]);
 
-  if (!status) {
+  if (!status || !update) {
     return null;
   }
 
+  const updateDialog = <UpdateDialog update={update} open={updateOpen} onOpenChange={setUpdateOpen} />;
+
   if (page === "settings") {
-    return <SettingsPage onClose={() => setPage("status")} />;
+    return (
+      <>
+        <SettingsPage updateStatus={update} onUpdate={() => setUpdateOpen(true)} onClose={() => setPage("status")} />
+        {updateDialog}
+      </>
+    );
   }
 
   if (page === "pairing") {
@@ -74,54 +85,69 @@ function App() {
   const online = status.phones.filter((phone) => phone.online).length;
 
   return (
-    <main className="flex min-h-screen flex-col items-center px-6 pt-10 pb-6">
-      {status.phones.length === 0 ? (
-        <PairingCode status={status} />
-      ) : (
-        <>
-          <ul className="w-full divide-y rounded-xl border bg-card text-sm">
-            {status.phones.map((phone) => (
-              <li key={phone.id} className="flex items-center gap-3 px-4 py-3">
-                <SmartphoneIcon className="size-4 shrink-0 text-muted-foreground" />
-                <span className={cn("flex-1 truncate", !phone.online && "text-muted-foreground")}>{phone.name}</span>
-                <span
-                  className={cn("size-2 shrink-0 rounded-full", phone.online ? "bg-green-600" : "bg-muted-foreground/40")}
-                />
-                <Button variant="outline" size="xs" onClick={() => invoke("unpair_phone", { id: phone.id })}>
-                  取消配对
+    <>
+      <main className="flex min-h-screen flex-col items-center px-6 pt-10 pb-6">
+        {status.phones.length === 0 ? (
+          <PairingCode status={status} />
+        ) : (
+          <>
+            <ul className="w-full divide-y rounded-xl border bg-card text-sm">
+              {status.phones.map((phone) => (
+                <li key={phone.id} className="flex items-center gap-3 px-4 py-3">
+                  <SmartphoneIcon className="size-4 shrink-0 text-muted-foreground" />
+                  <span className={cn("flex-1 truncate", !phone.online && "text-muted-foreground")}>{phone.name}</span>
+                  <span
+                    className={cn("size-2 shrink-0 rounded-full", phone.online ? "bg-green-600" : "bg-muted-foreground/40")}
+                  />
+                  <Button variant="outline" size="xs" onClick={() => invoke("unpair_phone", { id: phone.id })}>
+                    取消配对
+                  </Button>
+                </li>
+              ))}
+            </ul>
+            <Button variant="ghost" size="sm" className="mt-2 self-start text-muted-foreground" onClick={() => setPage("pairing")}>
+              <PlusIcon />
+              配对新手机
+            </Button>
+          </>
+        )}
+
+        <ul className="mt-8 w-full divide-y rounded-xl border bg-card text-sm">
+          <StatusRow ok={online > 0}>{connectionLabel(online, status.outdated)}</StatusRow>
+          <StatusRow
+            ok={status.inputPermission === true}
+            action={
+              status.inputPermission === false && (
+                <Button variant="outline" size="xs" onClick={() => invoke("open_accessibility_settings")}>
+                  打开系统设置
                 </Button>
-              </li>
-            ))}
-          </ul>
-          <Button variant="ghost" size="sm" className="mt-2 self-start text-muted-foreground" onClick={() => setPage("pairing")}>
-            <PlusIcon />
-            配对新手机
-          </Button>
-        </>
-      )}
+              )
+            }
+          >
+            {status.inputPermission === false ? "需要允许辅助功能" : "可以控制指针"}
+          </StatusRow>
+          <StatusRow ok={status.dictationReady}>{status.dictationReady ? "语音输入可用" : "语音输入未配置"}</StatusRow>
+          {update.prompt && (
+            <StatusRow
+              ok
+              action={
+                <Button variant="outline" size="xs" onClick={() => setUpdateOpen(true)}>
+                  更新
+                </Button>
+              }
+            >
+              新版本 {update.availableVersion} 可用
+            </StatusRow>
+          )}
+        </ul>
 
-      <ul className="mt-8 w-full divide-y rounded-xl border bg-card text-sm">
-        <StatusRow ok={online > 0}>{connectionLabel(online, status.outdated)}</StatusRow>
-        <StatusRow
-          ok={status.inputPermission === true}
-          action={
-            status.inputPermission === false && (
-              <Button variant="outline" size="xs" onClick={() => invoke("open_accessibility_settings")}>
-                打开系统设置
-              </Button>
-            )
-          }
-        >
-          {status.inputPermission === false ? "需要允许辅助功能" : "可以控制指针"}
-        </StatusRow>
-        <StatusRow ok={status.dictationReady}>{status.dictationReady ? "语音输入可用" : "语音输入未配置"}</StatusRow>
-      </ul>
-
-      <Button variant="ghost" size="sm" className="mt-auto text-muted-foreground" onClick={() => setPage("settings")}>
-        <SettingsIcon />
-        设置
-      </Button>
-    </main>
+        <Button variant="ghost" size="sm" className="mt-auto text-muted-foreground" onClick={() => setPage("settings")}>
+          <SettingsIcon />
+          设置
+        </Button>
+      </main>
+      {updateDialog}
+    </>
   );
 }
 
