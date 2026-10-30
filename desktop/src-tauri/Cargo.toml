@@ -27,7 +27,9 @@ tokio = { version = "1.54.1", features = ["full"] }
 axum = { version = "0.8.9", features = ["ws"] }
 futures-util = "0.3.34"
 prost = "0.14.4"
-enigo = { version = "0.6.1", features = ["platform_specific"] }
+# 0.6.1 在 macOS 上会一直用启动时的主显示器换算指针位置，显示器变化后指针只能贴着屏幕顶部移动；
+# 上游已修复但尚未发版，先固定到包含修复的提交。
+enigo = { git = "https://github.com/enigo-rs/enigo", rev = "a88d9b7e2cec7043ab5f03e754500a091ea928d1", features = ["platform_specific"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rand = "0.10.3"
 sha2 = "0.11.1"
@@ -42,6 +44,12 @@ tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 gethostname = "1.1.0"
 tauri-plugin-opener = "2.7.2"
+mdns-sd = "0.21.6"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1"] }
+tower-service = "0.3"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto"] }
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["server", "http1"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

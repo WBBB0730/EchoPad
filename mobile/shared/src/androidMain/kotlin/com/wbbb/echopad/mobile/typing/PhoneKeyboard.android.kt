@@ -10,9 +10,12 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusTargetModifierNode
 import androidx.compose.ui.node.CompositionLocalConsumerModifierNode
+import androidx.compose.ui.node.DelegatingNode
 import androidx.compose.ui.node.ModifierNodeElement
 import androidx.compose.ui.node.currentValueOf
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.platform.PlatformTextInputModifierNode
@@ -31,15 +34,22 @@ private data class PhoneKeyboardElement(val keyboard: KeyboardInput, val open: B
     override fun update(node: PhoneKeyboardNode) = node.update(keyboard, open)
 }
 
-/** 打开时建立输入法会话，输入法的输出经 [DirectInputConnection] 交给 [KeyboardInput]。 */
+/**
+ * 打开时建立输入法会话，输入法的输出经 [DirectInputConnection] 交给 [KeyboardInput]。
+ * 系统只把输入法连到拿到焦点的界面上，所以打开时先申请焦点，拿到焦点后才建立会话；
+ * 否则应用冷启动后界面还没有焦点，输入法会连到窗口自带的空连接上，打的字全部丢失。
+ */
 private class PhoneKeyboardNode(
     private var keyboard: KeyboardInput,
     private var open: Boolean,
-) : Modifier.Node(), PlatformTextInputModifierNode, CompositionLocalConsumerModifierNode {
+) : DelegatingNode(), PlatformTextInputModifierNode, CompositionLocalConsumerModifierNode {
+    private val focusTarget = delegate(
+        FocusTargetModifierNode(onFocusChange = { _, current -> onFocusChanged(current.isFocused) }),
+    )
     private var session: Job? = null
 
     override fun onAttach() {
-        if (open) startSession()
+        if (open) focusTarget.requestFocus()
     }
 
     fun update(keyboard: KeyboardInput, open: Boolean) {
@@ -47,12 +57,28 @@ private class PhoneKeyboardNode(
         this.keyboard = keyboard
         this.open = open
         if (!isAttached) return
+        stopSession()
+        when {
+            !open -> {
+                hideSoftInput()
+                currentValueOf(LocalFocusManager).clearFocus()
+            }
+            focusTarget.focusState.isFocused -> startSession()
+            else -> focusTarget.requestFocus()
+        }
+    }
+
+    private fun onFocusChanged(focused: Boolean) {
+        if (focused && open) startSession() else stopSession()
+    }
+
+    private fun stopSession() {
         session?.cancel()
         session = null
-        if (open) startSession() else hideSoftInput()
     }
 
     private fun startSession() {
+        stopSession()
         val keyboard = keyboard
         session = coroutineScope.launch {
             establishTextInputSession {

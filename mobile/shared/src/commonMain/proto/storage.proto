@@ -1,0 +1,26 @@
+// 手机端保存在本机的配对信息（docs/prd/pairing.md、ADR-0015）。只在手机端使用，不在两端之间传输。
+syntax = "proto3";
+
+package echopad.mobile.v1;
+
+option java_package = "com.wbbb.echopad.mobile.storage";
+
+// 一台配过的电脑端。
+message StoredDesktop {
+  // 电脑端标识。
+  string id = 1;
+  string name = 2;
+  string host = 3;
+  int32 port = 4;
+  string device_key = 5;
+  // 电脑端证书的 SHA-256 指纹（Base64URL，不补齐），只连接证书对得上的电脑端（ADR-0014）。
+  string fingerprint = 6;
+}
+
+message StoredPairing {
+  repeated StoredDesktop desktops = 1;
+  // 当前电脑的电脑端标识，没有时为空。
+  string active_id = 2;
+  // 这部手机端的固定标识，第一次需要时生成。
+  string phone_id = 3;
+}

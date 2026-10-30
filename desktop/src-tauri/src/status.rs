@@ -1,4 +1,4 @@
-//! 电脑端界面显示的状态：配对码、已连接的手机端、权限与语音输入是否可用。
+//! 电脑端界面显示的状态：配对码、配过的手机端及是否在线、权限与语音输入是否可用。
 
 use std::sync::Mutex;
 
@@ -10,18 +10,19 @@ use serde::Serialize;
 pub struct Status {
     pub pairing_link: String,
     pub pairing_qr_svg: String,
-    pub connected_devices: Vec<ConnectedDevice>,
+    pub phones: Vec<PhoneStatus>,
     /// 尚未检查时为 `None`。
     pub input_permission: Option<bool>,
     pub dictation_ready: bool,
 }
 
-/// 一个已连接的手机端。`id` 区分每一次连接，电脑端断开连接时用它指定是哪一个。
-#[derive(Clone, Serialize)]
+/// 一部配过的手机端。`id` 是手机端的固定标识，取消配对、让它切换过来时用它指定是哪一部。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConnectedDevice {
-    pub id: u64,
+pub struct PhoneStatus {
+    pub id: String,
     pub name: String,
+    pub online: bool,
 }
 
 pub struct StatusHub {
@@ -30,20 +31,15 @@ pub struct StatusHub {
 }
 
 impl StatusHub {
-    pub fn new(
-        pairing_link: String,
-        dictation_ready: bool,
-        notify: impl Fn(&Status) + Send + Sync + 'static,
-    ) -> Self {
-        tracing::debug!(link = %pairing_link, "pairing link");
-        let pairing_qr_svg = qr_svg(&pairing_link);
+    /// 配对码和配过的手机端由连接服务在启动时发布。
+    pub fn new(notify: impl Fn(&Status) + Send + Sync + 'static) -> Self {
         Self {
             status: Mutex::new(Status {
-                pairing_link,
-                pairing_qr_svg,
-                connected_devices: Vec::new(),
+                pairing_link: String::new(),
+                pairing_qr_svg: String::new(),
+                phones: Vec::new(),
                 input_permission: None,
-                dictation_ready,
+                dictation_ready: false,
             }),
             notify: Box::new(notify),
         }
@@ -61,12 +57,8 @@ impl StatusHub {
         });
     }
 
-    pub fn device_connected(&self, id: u64, name: &str) {
-        self.update(|status| status.connected_devices.push(ConnectedDevice { id, name: name.to_owned() }));
-    }
-
-    pub fn device_disconnected(&self, id: u64) {
-        self.update(|status| status.connected_devices.retain(|device| device.id != id));
+    pub fn set_phones(&self, phones: Vec<PhoneStatus>) {
+        self.update(|status| status.phones = phones);
     }
 
     pub fn set_input_permission(&self, granted: bool) {

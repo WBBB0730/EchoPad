@@ -8,10 +8,13 @@ plugins {
     alias(libs.plugins.wire)
 }
 
-// 手机端与电脑端共享的消息定义（ADR-0003）。
+// 手机端与电脑端共享的消息定义（ADR-0003），以及只在手机端使用的本机存储结构。
 wire {
     sourcePath {
         srcDir("../../protocol")
+    }
+    sourcePath {
+        srcDir("src/commonMain/proto")
     }
     kotlin {}
 }
@@ -65,6 +68,7 @@ kotlin {
             implementation(libs.androidx.lifecycle.viewmodelCompose)
             implementation(libs.androidx.lifecycle.runtimeCompose)
             implementation(libs.androidx.datastore.preferencesCore)
+            implementation(libs.kermit)
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.ktor.client.cio)
             implementation(libs.ktor.client.core)

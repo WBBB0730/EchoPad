@@ -1,5 +1,6 @@
 package com.wbbb.echopad.mobile.pairing
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,25 +27,17 @@ fun PairingScreen(onScanned: (String) -> Unit, onScanUnavailable: () -> Unit) {
     var scanning by rememberSaveable { mutableStateOf(false) }
 
     if (scanning) {
-        Box(Modifier.fillMaxSize()) {
-            QrScanner(
-                onScanned = {
-                    scanning = false
-                    onScanned(it)
-                },
-                onUnavailable = {
-                    scanning = false
-                    onScanUnavailable()
-                },
-                modifier = Modifier.fillMaxSize(),
-            )
-            TextButton(
-                onClick = { scanning = false },
-                modifier = Modifier.align(Alignment.BottomCenter).padding(32.dp),
-            ) {
-                Text("取消", color = EchoPadColors.Text)
-            }
-        }
+        ScanOverlay(
+            onScanned = {
+                scanning = false
+                onScanned(it)
+            },
+            onUnavailable = {
+                scanning = false
+                onScanUnavailable()
+            },
+            onCancel = { scanning = false },
+        )
     } else {
         Column(
             modifier = Modifier.fillMaxSize().padding(32.dp),
@@ -56,6 +49,20 @@ fun PairingScreen(onScanned: (String) -> Unit, onScanUnavailable: () -> Unit) {
             Button(onClick = { scanning = true }) {
                 Text("扫码配对")
             }
+        }
+    }
+}
+
+/** 铺满全屏的扫码画面，底部是"取消"。 */
+@Composable
+fun ScanOverlay(onScanned: (String) -> Unit, onUnavailable: () -> Unit, onCancel: () -> Unit) {
+    Box(Modifier.fillMaxSize().background(EchoPadColors.Background)) {
+        QrScanner(onScanned = onScanned, onUnavailable = onUnavailable, modifier = Modifier.fillMaxSize())
+        TextButton(
+            onClick = onCancel,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(32.dp),
+        ) {
+            Text("取消", color = EchoPadColors.Text)
         }
     }
 }

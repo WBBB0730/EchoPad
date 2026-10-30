@@ -1,4 +1,4 @@
-//! 手机端连接的 WebSocket 服务（ADR-0003、ADR-0004、docs/prd/pairing.md）。
+//! 手机端连接的 WebSocket 服务（ADR-0003、ADR-0004、ADR-0014、ADR-0015、docs/prd/pairing.md）。
 
 use std::{
     collections::HashMap,
@@ -13,30 +13,34 @@ use std::{
 use axum::{
     Router,
     extract::{
-        State, WebSocketUpgrade,
+        Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     response::Response,
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitStream};
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
 use prost::Message as _;
 use tokio::{
     net::TcpListener,
     sync::{Notify, mpsc},
     time::timeout,
 };
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+use tower_service::Service;
 
 use crate::{
     dictation::{DictationHandle, DictationService},
-    input::{InputCommand, InputSink, MouseButton, Shortcut, SpecialKey},
+    input::{InputCommand, InputSink, MouseButton, Owner, Shortcut, SpecialKey},
     pairing::{AuthOutcome, Credential, DeviceId, PairingStore, pairing_link},
     protocol::{
-        self, ClientMessage, DictationFailed, Hello, Rejected, ServerMessage, Welcome,
-        button_action::Kind, client_message, hello, key_press, rejected, server_message,
-        shortcut_action, zoom::Phase as ZoomPhase,
+        self, ClientMessage, DictationFailed, Hello, Rejected, ServerMessage, SwitchRequest, Welcome,
+        button_action::Kind, client_message, hello, key_press, rejected, server_message, shortcut_action,
+        zoom::Phase as ZoomPhase,
     },
-    status::StatusHub,
+    status::{PhoneStatus, StatusHub},
 };
 
 pub const PORT: u16 = 47321;
@@ -48,19 +52,23 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub struct ServerContext {
     pub desktop_name: String,
-    pub host: IpAddr,
+    /// 配对码里的局域网地址，电脑换了网络后会更新。
+    host: Mutex<IpAddr>,
+    /// 电脑端证书的指纹，放进配对码（ADR-0014）。
+    fingerprint: String,
     pub pairing: Mutex<PairingStore>,
     pub status: Arc<StatusHub>,
     pub input: Arc<dyn InputSink>,
     /// 缺少语音输入的配置时为 `None`；保存设置后会被替换，不用重启电脑端。
     dictation: RwLock<Option<Arc<dyn DictationService>>>,
-    /// 当前的连接，电脑端断开连接时据此找到要关闭的连接。
-    sessions: Mutex<HashMap<u64, Session>>,
+    /// 当前的连接：取消配对或同一部手机重新连上时据此关闭连接，让手机端切换过来时据此给它发消息。
+    sessions: Mutex<HashMap<Owner, Session>>,
     next_session_id: AtomicU64,
 }
 
 struct Session {
     device: DeviceId,
+    outbound: mpsc::UnboundedSender<ServerMessage>,
     close: Arc<Notify>,
 }
 
@@ -68,39 +76,69 @@ impl ServerContext {
     pub fn new(
         desktop_name: String,
         host: IpAddr,
+        fingerprint: String,
         pairing: PairingStore,
         status: Arc<StatusHub>,
         input: Arc<dyn InputSink>,
     ) -> Self {
-        Self {
+        let context = Self {
             desktop_name,
-            host,
+            host: Mutex::new(host),
+            fingerprint,
             pairing: Mutex::new(pairing),
             status,
             input,
             dictation: RwLock::new(None),
             sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
-        }
+        };
+        context.status.set_pairing_link(context.pairing_link());
+        context.publish_phones();
+        context
     }
 
     pub fn pairing_link(&self) -> String {
-        pairing_link(self.host, PORT, self.pairing.lock().unwrap().pairing_token())
+        let pairing = self.pairing.lock().unwrap();
+        pairing_link(
+            *self.host.lock().unwrap(),
+            PORT,
+            pairing.pairing_token(),
+            pairing.desktop_id(),
+            &self.fingerprint,
+        )
     }
 
-    /// 从电脑端断开一台手机端：作废它的设备密钥并关闭它的连接，之后它要重新扫码配对。
-    pub fn disconnect(&self, session_id: u64) -> anyhow::Result<()> {
-        let Some(device) = self.sessions.lock().unwrap().get(&session_id).map(|session| session.device.clone()) else {
-            return Ok(());
-        };
-        self.pairing.lock().unwrap().forget(&device)?;
-        self.close_sessions(|other| *other == device);
+    /// 电脑换了网络或 IP 后更新配对码里的地址。
+    pub fn update_host(&self, host: IpAddr) {
+        let changed = std::mem::replace(&mut *self.host.lock().unwrap(), host) != host;
+        if changed {
+            self.status.set_pairing_link(self.pairing_link());
+        }
+    }
+
+    /// 取消一部手机端的配对：作废它的设备密钥并关闭它的连接，之后它要重新扫码配对。
+    pub fn unpair(&self, phone_id: &str) -> anyhow::Result<()> {
+        let device = self.pairing.lock().unwrap().forget(phone_id)?;
+        if let Some(device) = device {
+            for session in self.sessions.lock().unwrap().values().filter(|session| session.device == device) {
+                session.close.notify_one();
+            }
+        }
+        self.publish_phones();
         Ok(())
     }
 
-    fn close_sessions(&self, matches: impl Fn(&DeviceId) -> bool) {
-        for session in self.sessions.lock().unwrap().values().filter(|session| matches(&session.device)) {
-            session.close.notify_one();
+    /// 让一部在线的手机端切换过来，把这台电脑端设为它的当前电脑（ADR-0015）。
+    pub fn request_switch(&self, phone_id: &str) {
+        let phone = self.pairing.lock().unwrap().phones().into_iter().find(|phone| phone.id == phone_id);
+        let Some(phone) = phone else {
+            return;
+        };
+        let request = ServerMessage {
+            body: Some(server_message::Body::SwitchRequest(SwitchRequest {})),
+        };
+        for session in self.sessions.lock().unwrap().values().filter(|session| session.device == phone.device) {
+            let _ = session.outbound.send(request.clone());
         }
     }
 
@@ -109,11 +147,58 @@ impl ServerContext {
         self.status.set_dictation_ready(service.is_some());
         *self.dictation.write().unwrap() = service;
     }
+
+    /// 把配过的手机端及是否在线告诉界面。
+    fn publish_phones(&self) {
+        let phones = self.pairing.lock().unwrap().phones();
+        let phones = {
+            let sessions = self.sessions.lock().unwrap();
+            phones
+                .into_iter()
+                .map(|phone| PhoneStatus {
+                    online: sessions.values().any(|session| session.device == phone.device),
+                    id: phone.id,
+                    name: phone.name,
+                })
+                .collect()
+        };
+        self.status.set_phones(phones);
+    }
 }
 
-pub async fn serve(listener: TcpListener, context: Arc<ServerContext>) -> std::io::Result<()> {
+/// 在 TLS 上提供 WebSocket 服务（ADR-0014），每条连接各自握手，互不影响。
+pub async fn serve(listener: TcpListener, context: Arc<ServerContext>, tls: Arc<ServerConfig>) {
     let router = Router::new().route("/ws", get(upgrade)).with_state(context);
-    axum::serve(listener, router).await
+    let acceptor = TlsAcceptor::from(tls);
+    loop {
+        let (stream, address) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                // 和 axum::serve 一样：接受连接失败（例如文件描述符用完）时稍等再继续。
+                tracing::warn!("failed to accept a connection: {err}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            let stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    tracing::debug!(%address, "TLS handshake failed: {err}");
+                    return;
+                }
+            };
+            let service = hyper::service::service_fn(move |request: Request<Incoming>| router.clone().call(request));
+            let connection = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades();
+            if let Err(err) = connection.await {
+                tracing::debug!(%address, "connection ended with an error: {err}");
+            }
+        });
+    }
 }
 
 async fn upgrade(socket: WebSocketUpgrade, State(context): State<Arc<ServerContext>>) -> Response {
@@ -129,8 +214,6 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
     let (reply, device) = match authenticate(&context, &hello) {
         Some(AuthOutcome::Paired { device_key, device }) => {
             context.status.set_pairing_link(context.pairing_link());
-            // 一台电脑端只与一部手机端配对：原来那部的设备密钥已作废，它的连接也立即关闭。
-            context.close_sessions(|other| *other != device);
             (welcome(&context, device_key), Some(device))
         }
         Some(AuthOutcome::Recognized(device)) => (welcome(&context, String::new()), Some(device)),
@@ -149,12 +232,27 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
 
     let session_id = context.next_session_id.fetch_add(1, Ordering::Relaxed);
     let close = Arc::new(Notify::new());
-    context.sessions.lock().unwrap().insert(session_id, Session { device, close: close.clone() });
+    let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    {
+        let mut sessions = context.sessions.lock().unwrap();
+        // 一部手机对这台电脑只保持一条连接（ADR-0015）。它重新连上时，旧连接已经断了，只是还没等到心跳超时：
+        // 立即关掉，松开旧连接按住的鼠标键。
+        for previous in sessions.values().filter(|session| session.device == device) {
+            previous.close.notify_one();
+        }
+        sessions.insert(
+            session_id,
+            Session {
+                device,
+                outbound: outbound.clone(),
+                close: close.clone(),
+            },
+        );
+    }
+    context.publish_phones();
     let device_name = hello.device_name;
-    context.status.device_connected(session_id, &device_name);
     tracing::info!(device = %device_name, "mobile app connected");
 
-    let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let forward = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
             if writer.send(Message::Binary(message.encode_to_vec().into())).await.is_err() {
@@ -168,7 +266,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
         // 任何帧（包括心跳）都会重置超时；超时或出错都按断线处理。
         let received = tokio::select! {
             _ = close.notified() => {
-                tracing::info!(device = %device_name, "disconnected from the desktop app");
+                tracing::info!(device = %device_name, "connection closed by the desktop app");
                 break;
             }
             received = timeout(IDLE_TIMEOUT, reader.next()) => received,
@@ -188,7 +286,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
         match frame {
             Message::Binary(bytes) => match ClientMessage::decode(bytes) {
                 Ok(ClientMessage { body: Some(body) }) => {
-                    dispatch(&context, body, &mut dictations, &outbound);
+                    dispatch(&context, session_id, body, &mut dictations, &outbound);
                 }
                 Ok(ClientMessage { body: None }) => {}
                 Err(err) => tracing::warn!("ignored malformed message: {err}"),
@@ -198,12 +296,12 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
         }
     }
 
-    // 断线收尾：松开被按住的鼠标键，丢弃未完成的语音输入。
-    context.input.send(InputCommand::ReleaseAll);
+    // 断线收尾：只松开这部手机按住的鼠标键，丢弃它未完成的语音输入。
+    context.input.send(InputCommand::ReleaseAll { owner: session_id });
     drop(dictations);
     forward.abort();
     context.sessions.lock().unwrap().remove(&session_id);
-    context.status.device_disconnected(session_id);
+    context.publish_phones();
     tracing::info!(device = %device_name, "mobile app disconnected");
 }
 
@@ -225,7 +323,7 @@ fn authenticate(context: &ServerContext, hello: &Hello) -> Option<AuthOutcome> {
         hello::Credential::DeviceKey(key) => Credential::DeviceKey(key),
     };
     let mut pairing = context.pairing.lock().unwrap();
-    match pairing.authenticate(&hello.device_name, credential) {
+    match pairing.authenticate(&hello.phone_id, &hello.device_name, credential) {
         Ok(outcome) => Some(outcome),
         Err(err) => {
             tracing::error!("failed to save pairing: {err:#}");
@@ -238,11 +336,13 @@ fn welcome(context: &ServerContext, device_key: String) -> server_message::Body 
     server_message::Body::Welcome(Welcome {
         desktop_name: context.desktop_name.clone(),
         device_key,
+        desktop_id: context.pairing.lock().unwrap().desktop_id().to_owned(),
     })
 }
 
 fn dispatch(
     context: &ServerContext,
+    owner: Owner,
     body: client_message::Body,
     dictations: &mut HashMap<u32, DictationHandle>,
     outbound: &mpsc::UnboundedSender<ServerMessage>,
@@ -264,8 +364,8 @@ fn dispatch(
             let command = match action.kind() {
                 Kind::Click => InputCommand::Click(button),
                 Kind::DoubleClick => InputCommand::DoubleClick(button),
-                Kind::Press => InputCommand::Press(button),
-                Kind::Release => InputCommand::Release(button),
+                Kind::Press => InputCommand::Press { owner, button },
+                Kind::Release => InputCommand::Release { owner, button },
                 Kind::Unspecified => return,
             };
             context.input.send(command);
@@ -276,11 +376,12 @@ fn dispatch(
         }),
         Body::Zoom(zoom) => {
             let command = match zoom.phase() {
-                ZoomPhase::Began => InputCommand::ZoomStart,
+                ZoomPhase::Began => InputCommand::ZoomStart { owner },
                 ZoomPhase::Changed => InputCommand::Zoom {
+                    owner,
                     magnification: zoom.magnification,
                 },
-                ZoomPhase::Ended => InputCommand::ZoomEnd,
+                ZoomPhase::Ended => InputCommand::ZoomEnd { owner },
                 ZoomPhase::Unspecified => return,
             };
             context.input.send(command);
@@ -382,21 +483,35 @@ fn encode(body: server_message::Body) -> Message {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::Ipv4Addr, time::Duration};
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
 
     use tokio::net::TcpStream;
-    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite};
+    use tokio_rustls::{
+        TlsConnector,
+        client::TlsStream,
+        rustls::{
+            ClientConfig, DigitallySignedStruct, SignatureScheme,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            crypto::{self, CryptoProvider, aws_lc_rs},
+            pki_types::{CertificateDer, ServerName, UnixTime},
+        },
+    };
+    use tokio_tungstenite::{WebSocketStream, tungstenite};
 
     use super::*;
     use crate::{
+        certificate::{CERTIFICATE_NAME, DesktopCertificate},
         dictation::{AudioFrame, Cleaner, Outbound, RecognitionEvent, run_pipeline},
         protocol::{
-            AudioChunk, ButtonAction, DictationCancel, DictationStart, DictationStop, KeyPress, PointerMove, ShortcutAction,
-            TypeText, Zoom,
+            AudioChunk, ButtonAction, DictationCancel, DictationStart, DictationStop, KeyPress, PointerMove,
+            ShortcutAction, TypeText, Zoom,
         },
     };
 
-    type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
+    type Client = WebSocketStream<TlsStream<TcpStream>>;
 
     #[derive(Default)]
     struct RecordingInput(Mutex<Vec<InputCommand>>);
@@ -444,26 +559,85 @@ mod tests {
         }
     }
 
+    /// 手机端的做法：只认配对码里指纹对应的那张证书（ADR-0014）。
+    #[derive(Debug)]
+    struct PinnedCertificate(CertificateDer<'static>);
+
+    impl ServerCertVerifier for PinnedCertificate {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
+            if end_entity.as_ref() == self.0.as_ref() {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(tokio_rustls::rustls::Error::General("unexpected certificate".into()))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            signature: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+            crypto::verify_tls12_signature(message, certificate, signature, &provider().signature_verification_algorithms)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            signature: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+            crypto::verify_tls13_signature(message, certificate, signature, &provider().signature_verification_algorithms)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            provider().signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    fn provider() -> CryptoProvider {
+        aws_lc_rs::default_provider()
+    }
+
     struct Harness {
         context: Arc<ServerContext>,
         input: Arc<RecordingInput>,
-        url: String,
+        address: SocketAddr,
+        certificate: CertificateDer<'static>,
     }
 
     async fn start_server(dictation: Option<Arc<dyn DictationService>>) -> Harness {
-        let path = std::env::temp_dir()
-            .join(format!("echopad-server-{}", uuid::Uuid::new_v4()))
-            .join("paired-devices.json");
-        let pairing = PairingStore::load(path).unwrap();
+        let dir = std::env::temp_dir().join(format!("echopad-server-{}", uuid::Uuid::new_v4()));
+        let certificate = DesktopCertificate::load_or_create(&dir).unwrap();
+        let pairing = PairingStore::load(dir.join("paired-devices.json")).unwrap();
         let host = IpAddr::from(Ipv4Addr::LOCALHOST);
         let input = Arc::new(RecordingInput::default());
-        let status = Arc::new(StatusHub::new(pairing_link(host, PORT, pairing.pairing_token()), false, |_| {}));
-        let context = Arc::new(ServerContext::new("Test Mac".into(), host, pairing, status, input.clone()));
+        let status = Arc::new(StatusHub::new(|_| {}));
+        let context = Arc::new(ServerContext::new(
+            "Test Mac".into(),
+            host,
+            certificate.fingerprint(),
+            pairing,
+            status,
+            input.clone(),
+        ));
         context.set_dictation(dictation);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-        tokio::spawn(serve(listener, context.clone()));
-        Harness { context, input, url }
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, context.clone(), certificate.server_config().unwrap()));
+        Harness {
+            context,
+            input,
+            address,
+            certificate: certificate.der().clone(),
+        }
     }
 
     impl Harness {
@@ -471,43 +645,71 @@ mod tests {
             self.context.pairing.lock().unwrap().pairing_token().to_owned()
         }
 
-        async fn connect(&self, credential: hello::Credential) -> (Client, server_message::Body) {
-            let (mut client, _) = connect_async(&self.url).await.unwrap();
-            send(&mut client, client_message::Body::Hello(Hello { device_name: "Phone".into(), credential: Some(credential) })).await;
+        /// 像手机端一样建立加密连接：只认这台电脑端的证书。
+        async fn open(&self) -> Client {
+            let config = ClientConfig::builder_with_provider(Arc::new(provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinnedCertificate(self.certificate.clone())))
+                .with_no_client_auth();
+            let tcp = TcpStream::connect(self.address).await.unwrap();
+            let tls = TlsConnector::from(Arc::new(config))
+                .connect(ServerName::try_from(CERTIFICATE_NAME).unwrap(), tcp)
+                .await
+                .unwrap();
+            let (client, _) = tokio_tungstenite::client_async(format!("wss://{CERTIFICATE_NAME}/ws"), tls).await.unwrap();
+            client
+        }
+
+        async fn connect(&self, phone_id: &str, credential: hello::Credential) -> (Client, server_message::Body) {
+            let mut client = self.open().await;
+            let hello = Hello {
+                device_name: format!("Phone {phone_id}"),
+                credential: Some(credential),
+                phone_id: phone_id.into(),
+            };
+            send(&mut client, client_message::Body::Hello(hello)).await;
             let reply = receive(&mut client).await;
             (client, reply)
         }
 
-        /// 等电脑端登记好刚连上的手机端，返回这次连接的编号。
-        async fn connected_device(&self) -> u64 {
-            for _ in 0..100 {
-                if let Some(device) = self.context.status.snapshot().connected_devices.first() {
-                    return device.id;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!("the mobile app was not registered as connected");
+        /// 用当前的配对码配对一部手机端，返回连接和发放的设备密钥。
+        async fn pair(&self, phone_id: &str) -> (Client, String) {
+            let (client, reply) = self.connect(phone_id, hello::Credential::PairingToken(self.pairing_token())).await;
+            let server_message::Body::Welcome(Welcome { device_key, .. }) = reply else {
+                panic!("expected pairing to succeed, got {reply:?}");
+            };
+            (client, device_key)
         }
 
-        async fn wait_until_no_device_is_connected(&self) {
+        /// 等电脑端界面上的手机端列表变成预期的样子。
+        async fn wait_for_phones(&self, expected: &[(&str, bool)]) {
             for _ in 0..100 {
-                if self.context.status.snapshot().connected_devices.is_empty() {
+                let phones: Vec<_> = self.context.status.snapshot().phones;
+                let actual: Vec<_> = phones.iter().map(|phone| (phone.name.as_str(), phone.online)).collect();
+                if actual == expected {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            panic!("the mobile app is still listed as connected");
+            panic!("phones never became {expected:?}: {:?}", self.context.status.snapshot().phones);
         }
 
         /// 等电脑端处理完断线收尾。
         async fn wait_for_release_all(&self) {
+            self.wait_for_input(|command| matches!(command, InputCommand::ReleaseAll { .. })).await;
+        }
+
+        /// 等电脑端发出符合 `expected` 的键鼠操作。
+        async fn wait_for_input(&self, expected: impl Fn(&InputCommand) -> bool) {
             for _ in 0..100 {
-                if self.input.commands().contains(&InputCommand::ReleaseAll) {
+                if self.input.commands().iter().any(&expected) {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            panic!("the desktop app did not clean up after the disconnect");
+            panic!("the expected input never arrived: {:?}", self.input.commands());
         }
     }
 
@@ -526,29 +728,135 @@ mod tests {
     }
 
     async fn paired_client(harness: &Harness) -> Client {
-        let (client, reply) = harness.connect(hello::Credential::PairingToken(harness.pairing_token())).await;
-        assert!(matches!(reply, server_message::Body::Welcome(_)));
-        client
+        harness.pair("phone-1").await.0
     }
 
     #[tokio::test]
     async fn pairing_issues_a_device_key_that_works_for_later_connections() {
         let harness = start_server(None).await;
         let token = harness.pairing_token();
+        let link = harness.context.status.snapshot().pairing_link;
+        assert!(link.contains(&format!("fp={}", harness.context.fingerprint)));
 
-        let (_, reply) = harness.connect(hello::Credential::PairingToken(token.clone())).await;
-        let server_message::Body::Welcome(Welcome { desktop_name, device_key }) = reply else {
+        let (_, reply) = harness.connect("phone-1", hello::Credential::PairingToken(token.clone())).await;
+        let server_message::Body::Welcome(Welcome { desktop_name, device_key, desktop_id }) = reply else {
             panic!("expected pairing to succeed, got {reply:?}");
         };
         assert_eq!(desktop_name, "Test Mac");
         assert!(!device_key.is_empty());
+        assert_eq!(desktop_id, harness.context.pairing.lock().unwrap().desktop_id());
         assert!(!harness.context.status.snapshot().pairing_link.contains(&token));
 
-        let (_, reply) = harness.connect(hello::Credential::DeviceKey(device_key)).await;
+        let (_, reply) = harness.connect("phone-1", hello::Credential::DeviceKey(device_key)).await;
         assert!(matches!(reply, server_message::Body::Welcome(Welcome { device_key, .. }) if device_key.is_empty()));
 
-        let (_, reply) = harness.connect(hello::Credential::PairingToken(token)).await;
+        let (_, reply) = harness.connect("phone-2", hello::Credential::PairingToken(token)).await;
         assert!(matches!(reply, server_message::Body::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn several_phones_stay_connected_and_are_listed() {
+        let harness = start_server(None).await;
+        let (_first, _) = harness.pair("phone-1").await;
+        let (second, _) = harness.pair("phone-2").await;
+        harness.wait_for_phones(&[("Phone phone-1", true), ("Phone phone-2", true)]).await;
+
+        drop(second);
+
+        harness.wait_for_phones(&[("Phone phone-1", true), ("Phone phone-2", false)]).await;
+    }
+
+    #[tokio::test]
+    async fn a_disconnecting_phone_only_cleans_up_after_itself() {
+        let harness = start_server(None).await;
+        let (mut first, _) = harness.pair("phone-1").await;
+        let (mut second, _) = harness.pair("phone-2").await;
+        let press = client_message::Body::ButtonAction(ButtonAction {
+            button: protocol::MouseButton::Left.into(),
+            kind: Kind::Press.into(),
+        });
+        send(&mut first, press.clone()).await;
+        send(&mut second, press).await;
+        harness.wait_for_phones(&[("Phone phone-1", true), ("Phone phone-2", true)]).await;
+
+        drop(second);
+        harness.wait_for_release_all().await;
+
+        // 两部手机各按一次，按的是不同的连接；只有断线的那一部收尾，另一部按住的键不受影响。
+        let commands = harness.input.commands();
+        let pressed: Vec<_> = commands
+            .iter()
+            .filter_map(|command| match command {
+                InputCommand::Press { owner, .. } => Some(*owner),
+                _ => None,
+            })
+            .collect();
+        let released: Vec<_> = commands
+            .iter()
+            .filter_map(|command| match command {
+                InputCommand::ReleaseAll { owner } => Some(*owner),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pressed.len(), 2);
+        assert_ne!(pressed[0], pressed[1]);
+        assert_eq!(released.len(), 1);
+        assert!(pressed.contains(&released[0]));
+    }
+
+    #[tokio::test]
+    async fn a_reconnecting_phone_replaces_its_previous_connection() {
+        let harness = start_server(None).await;
+        let (mut previous, device_key) = harness.pair("phone-1").await;
+        send(
+            &mut previous,
+            client_message::Body::ButtonAction(ButtonAction {
+                button: protocol::MouseButton::Left.into(),
+                kind: Kind::Press.into(),
+            }),
+        )
+        .await;
+        harness.wait_for_input(|command| matches!(command, InputCommand::Press { .. })).await;
+
+        // 换网后手机端连上了新连接，旧连接还没等到心跳超时。
+        let (_current, reply) = harness.connect("phone-1", hello::Credential::DeviceKey(device_key)).await;
+        assert!(matches!(reply, server_message::Body::Welcome(_)));
+
+        let closed = timeout(Duration::from_secs(2), previous.next()).await.unwrap();
+        assert!(!matches!(closed, Some(Ok(tungstenite::Message::Binary(_)))));
+        harness.wait_for_release_all().await;
+        let commands = harness.input.commands();
+        let InputCommand::Press { owner, .. } = commands[0] else {
+            panic!("expected a press, got {commands:?}");
+        };
+        assert_eq!(commands[1..], [InputCommand::ReleaseAll { owner }]);
+        harness.wait_for_phones(&[("Phone phone-1", true)]).await;
+    }
+
+    #[tokio::test]
+    async fn unpairing_a_phone_closes_its_connection_and_revokes_its_key() {
+        let harness = start_server(None).await;
+        let (mut client, device_key) = harness.pair("phone-1").await;
+        harness.wait_for_phones(&[("Phone phone-1", true)]).await;
+
+        harness.context.unpair("phone-1").unwrap();
+
+        let closed = timeout(Duration::from_secs(2), client.next()).await.unwrap();
+        assert!(!matches!(closed, Some(Ok(tungstenite::Message::Binary(_)))));
+        harness.wait_for_phones(&[]).await;
+        let (_, reply) = harness.connect("phone-1", hello::Credential::DeviceKey(device_key)).await;
+        assert!(matches!(reply, server_message::Body::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn an_online_phone_can_be_asked_to_switch_over() {
+        let harness = start_server(None).await;
+        let (mut client, _) = harness.pair("phone-1").await;
+        harness.wait_for_phones(&[("Phone phone-1", true)]).await;
+
+        harness.context.request_switch("phone-1");
+
+        assert!(matches!(receive(&mut client).await, server_message::Body::SwitchRequest(_)));
     }
 
     #[tokio::test]
@@ -592,12 +900,18 @@ mod tests {
         client.close(None).await.unwrap();
         harness.wait_for_release_all().await;
 
+        let commands = harness.input.commands();
+        let InputCommand::ZoomStart { owner } = commands[0] else {
+            panic!("expected the zoom to start, got {commands:?}");
+        };
         assert_eq!(
-            harness.input.commands()[..3],
+            commands[1..3],
             [
-                InputCommand::ZoomStart,
-                InputCommand::Zoom { magnification: 0.25 },
-                InputCommand::ZoomEnd,
+                InputCommand::Zoom {
+                    owner,
+                    magnification: 0.25
+                },
+                InputCommand::ZoomEnd { owner },
             ]
         );
     }
@@ -618,10 +932,11 @@ mod tests {
         drop(client);
         harness.wait_for_release_all().await;
 
-        assert_eq!(
-            harness.input.commands(),
-            [InputCommand::Press(MouseButton::Left), InputCommand::ReleaseAll]
-        );
+        let commands = harness.input.commands();
+        let InputCommand::Press { owner, button: MouseButton::Left } = commands[0] else {
+            panic!("expected a press, got {commands:?}");
+        };
+        assert_eq!(commands[1..], [InputCommand::ReleaseAll { owner }]);
     }
 
     #[tokio::test]
@@ -699,38 +1014,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnecting_from_the_desktop_closes_the_connection_and_revokes_the_device_key() {
+    async fn a_new_lan_address_updates_the_pairing_code() {
         let harness = start_server(None).await;
-        let (mut client, reply) = harness.connect(hello::Credential::PairingToken(harness.pairing_token())).await;
-        let server_message::Body::Welcome(Welcome { device_key, .. }) = reply else {
-            panic!("expected pairing to succeed, got {reply:?}");
-        };
-        let id = harness.connected_device().await;
 
-        harness.context.disconnect(id).unwrap();
+        harness.context.update_host(IpAddr::from([192, 168, 1, 30]));
 
-        let closed = timeout(Duration::from_secs(2), client.next()).await.unwrap();
-        assert!(!matches!(closed, Some(Ok(tungstenite::Message::Binary(_)))));
-        harness.wait_until_no_device_is_connected().await;
-        let (_, reply) = harness.connect(hello::Credential::DeviceKey(device_key)).await;
-        assert!(matches!(reply, server_message::Body::Rejected(_)));
-    }
-
-    #[tokio::test]
-    async fn pairing_a_new_phone_disconnects_the_previous_one() {
-        let harness = start_server(None).await;
-        let (mut first, reply) = harness.connect(hello::Credential::PairingToken(harness.pairing_token())).await;
-        let server_message::Body::Welcome(Welcome { device_key: first_key, .. }) = reply else {
-            panic!("expected pairing to succeed, got {reply:?}");
-        };
-        harness.connected_device().await;
-
-        let _second = paired_client(&harness).await;
-
-        let closed = timeout(Duration::from_secs(2), first.next()).await.unwrap();
-        assert!(!matches!(closed, Some(Ok(tungstenite::Message::Binary(_)))));
-        let (_, reply) = harness.connect(hello::Credential::DeviceKey(first_key)).await;
-        assert!(matches!(reply, server_message::Body::Rejected(_)));
+        let link = harness.context.status.snapshot().pairing_link;
+        assert!(link.starts_with("echopad://pair?host=192.168.1.30&port=47321&"));
     }
 
     #[tokio::test]

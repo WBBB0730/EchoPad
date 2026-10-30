@@ -6,9 +6,10 @@ import com.wbbb.echopad.mobile.protocol.MouseButton
 import com.wbbb.echopad.mobile.protocol.PointerMove
 import com.wbbb.echopad.mobile.protocol.Scroll
 import com.wbbb.echopad.mobile.protocol.Zoom
+import kotlinx.coroutines.channels.Channel
 
 /**
- * 把手势换算成发给电脑端的消息。指针移动、滚动和缩放先累积，每帧屏幕刷新时由 [flush] 合并发送一次；
+ * 把手势换算成发给电脑端的消息。指针移动、滚动和缩放先累积，有累积时在下一帧屏幕刷新时由 [flush] 合并发送一次；
  * 按键操作和缩放的开始、结束立即发送，并先发出之前累积的移动，保证顺序不乱。
  */
 class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
@@ -22,12 +23,19 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
     /** 这一帧里两指距离累计变化的倍数。 */
     private var zoomScale = 1f
 
+    /** 有累积等着发送时有一个元素，多次累积只留一个。 */
+    private val pending = Channel<Unit>(Channel.CONFLATED)
+
+    /** 等到有累积要发送。界面收到后在下一帧调用 [flush]，手指不动时就不必每帧都醒来。 */
+    suspend fun awaitPending() = pending.receive()
+
     fun handle(action: TouchpadAction) {
         when (action) {
             is TouchpadAction.Move -> {
                 val (x, y) = PointerAcceleration.apply(action.dx, action.dy, action.durationMillis)
                 moveX += x * speed.pointer
                 moveY += y * speed.pointer
+                pending.trySend(Unit)
             }
             is TouchpadAction.Scroll -> scroll(action.dx, action.dy)
             is TouchpadAction.Fling -> Unit
@@ -36,7 +44,10 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
             TouchpadAction.DragStart -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_PRESS)
             TouchpadAction.DragEnd -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_RELEASE)
             TouchpadAction.ZoomStart -> zoom(Zoom.Phase.PHASE_BEGAN)
-            is TouchpadAction.Zoom -> zoomScale *= action.scale
+            is TouchpadAction.Zoom -> {
+                zoomScale *= action.scale
+                pending.trySend(Unit)
+            }
             TouchpadAction.ZoomEnd -> zoom(Zoom.Phase.PHASE_ENDED)
         }
     }
@@ -45,6 +56,7 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
     fun scroll(dx: Float, dy: Float) {
         scrollX += dx * SCROLL_GAIN * speed.scroll
         scrollY += dy * SCROLL_GAIN * speed.scroll
+        pending.trySend(Unit)
     }
 
     fun flush() {

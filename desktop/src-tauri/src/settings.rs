@@ -276,7 +276,7 @@ impl SettingsStore {
 }
 
 /// 文件里有密钥，只允许当前用户读写。
-fn write_private(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::{io::Write, os::unix::fs::OpenOptionsExt, os::unix::fs::PermissionsExt};

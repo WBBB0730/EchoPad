@@ -21,7 +21,14 @@ import kotlinx.coroutines.launch
 class EchoPadViewModel(platform: Platform) : ViewModel() {
     private val storage = platform.storage
     private val transport = KtorTransport()
-    val connection = DesktopConnection(storage.pairedDesktops, platform.deviceName, transport, viewModelScope)
+    val connection = DesktopConnection(
+        storage.pairedDesktops,
+        platform.deviceName,
+        transport,
+        viewModelScope,
+        platform.desktopFinder,
+        platform.networkChanges,
+    )
     val dictation = DictationController(connection, viewModelScope)
     val keyboard = KeyboardInput(connection)
 
@@ -36,7 +43,8 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
         connection.notices.map { notice ->
             when (notice) {
                 ConnectionNotice.PairingCodeRejected -> "配对码已失效，请重新扫码"
-                ConnectionNotice.PairingRevoked -> "电脑端已不认可这台手机，请重新扫码配对"
+                is ConnectionNotice.PairingRevoked -> "${notice.desktopName} 已取消和这部手机的配对"
+                is ConnectionNotice.SwitchedByDesktop -> "已切换到 ${notice.desktopName}"
             }
         },
         dictation.failures,
@@ -55,7 +63,4 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
         _notices.tryEmit(message)
     }
 
-    override fun onCleared() {
-        transport.close()
-    }
 }

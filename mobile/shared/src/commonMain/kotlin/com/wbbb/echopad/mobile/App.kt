@@ -53,6 +53,7 @@ fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
                         keyboard = viewModel.keyboard,
                         speed = touchpadSpeed,
                         onSpeedChange = viewModel::setTouchpadSpeed,
+                        onScanned = viewModel::onPairingLink,
                         onNotice = viewModel::notify,
                     )
                 }

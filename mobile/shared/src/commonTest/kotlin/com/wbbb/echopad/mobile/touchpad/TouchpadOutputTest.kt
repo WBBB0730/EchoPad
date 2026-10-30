@@ -4,16 +4,36 @@ import com.wbbb.echopad.mobile.protocol.ButtonAction
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.MouseButton
 import com.wbbb.echopad.mobile.protocol.Zoom
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import kotlin.math.abs
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class TouchpadOutputTest {
     private val sent = mutableListOf<ClientMessage>()
     private val output = TouchpadOutput { sent += it }
+
+    @Test
+    fun aFrameIsOnlyNeededOnceMovementAccumulates() = runTest {
+        val pending = async { output.awaitPending() }
+        runCurrent()
+        // 手指不动时不需要屏幕刷新；按键立即发送，也不需要。
+        output.handle(TouchpadAction.LeftClick)
+        runCurrent()
+        assertFalse(pending.isCompleted)
+
+        output.handle(TouchpadAction.Move(1f, 0f, 100))
+        runCurrent()
+        assertTrue(pending.isCompleted)
+    }
 
     @Test
     fun movementIsSentOncePerFrame() {

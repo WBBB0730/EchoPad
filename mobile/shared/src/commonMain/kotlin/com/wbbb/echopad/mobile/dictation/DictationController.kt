@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import okio.ByteString.Companion.toByteString
 
@@ -46,6 +47,10 @@ class DictationController(
         scope.launch {
             // 断线时电脑端会丢弃未完成的语音输入，手机端也随之结束。
             connection.state.collect { state -> if (state !is ConnectionState.Connected) reset() }
+        }
+        scope.launch {
+            // 切换到另一台电脑时，原来那台会丢弃未完成的语音输入（ADR-0015），手机端也随之结束。
+            connection.activeId.drop(1).collect { reset() }
         }
     }
 

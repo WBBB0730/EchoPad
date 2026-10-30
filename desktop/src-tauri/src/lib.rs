@@ -1,4 +1,6 @@
+mod certificate;
 mod dictation;
+mod discovery;
 mod input;
 mod pairing;
 mod protocol;
@@ -9,7 +11,7 @@ mod status;
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::Context;
@@ -22,14 +24,22 @@ use tauri::{
 use tauri_plugin_opener::OpenerExt;
 use tracing_subscriber::EnvFilter;
 
+use tokio_rustls::rustls::ServerConfig;
+
 use crate::{
+    certificate::DesktopCertificate,
     dictation::{CloudDictation, DictationService},
     input::InputController,
-    pairing::{PairingStore, pairing_link},
+    pairing::PairingStore,
     server::{PORT, ServerContext},
     settings::{CleanupModel, CleanupPreset, Credential, DoubaoResource, RecognitionService, Settings, SettingsStore},
-    status::{Status, StatusHub},
+    status::{PhoneStatus, Status, StatusHub},
 };
+
+/// 菜单栏图标的标识，手机端在线状态变化时据此更新右键菜单。
+const TRAY_ID: &str = "main";
+/// 右键菜单里"让某部手机控制这台电脑"的菜单项标识前缀，后面接手机端的固定标识。
+const SWITCH_MENU_PREFIX: &str = "switch:";
 
 struct AppState {
     server: Arc<ServerContext>,
@@ -119,10 +129,10 @@ fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Resul
     state.save_settings(settings)
 }
 
-/// 从电脑端断开一台手机端，它之后要重新扫码配对。
+/// 取消一部手机端的配对，它之后要重新扫码配对。
 #[tauri::command]
-fn disconnect_device(state: tauri::State<'_, AppState>, id: u64) -> Result<(), String> {
-    state.server.disconnect(id).map_err(|err| format!("{err:#}"))
+fn unpair_phone(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    state.server.unpair(&id).map_err(|err| format!("{err:#}"))
 }
 
 /// macOS「系统设置 › 隐私与安全性 › 辅助功能」页面。
@@ -142,23 +152,36 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // 电脑端常驻在菜单栏，不占用程序坞。
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             build_tray(app)?;
 
-            let state = build_state(app.handle())?;
+            let (state, tls) = build_state(app.handle())?;
             state.apply_settings();
             let server = state.server.clone();
             app.manage(state);
+
+            // 广播失败（例如网络不允许组播）时，只是手机端无法自动找到换了地址的电脑，其他功能照常。
+            let desktop_id = server.pairing.lock().unwrap().desktop_id().to_owned();
+            match discovery::advertise(&server.desktop_name, &desktop_id, PORT) {
+                Ok(daemon) => {
+                    let server = server.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let refresh = || match local_ip_address::local_ip() {
+                            Ok(host) => server.update_host(host),
+                            Err(err) => tracing::debug!("no LAN address: {err}"),
+                        };
+                        if let Err(err) = discovery::watch_addresses(&daemon, refresh).await {
+                            tracing::warn!("stopped watching network changes: {err:#}");
+                        }
+                    });
+                }
+                Err(err) => tracing::warn!("local network discovery unavailable: {err:#}"),
+            }
+
             tauri::async_runtime::spawn(async move {
                 let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT));
-                let result = match tokio::net::TcpListener::bind(address).await {
-                    Ok(listener) => server::serve(listener, server).await,
-                    Err(err) => Err(err),
-                };
-                if let Err(err) = result {
-                    tracing::error!("connection server stopped: {err}");
+                match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => server::serve(listener, server, tls).await,
+                    Err(err) => tracing::error!("failed to start the connection server: {err}"),
                 }
             });
             Ok(())
@@ -167,35 +190,32 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                hide_main_window(window);
             }
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_settings,
             save_settings,
-            disconnect_device,
+            unpair_phone,
             open_accessibility_settings
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
-            // 冷启动时显示主窗口：只在菜单栏的程序不会自动把窗口带到前台。
-            // 在后台运行时再次打开 EchoPad（例如在"应用程序"里双击），也显示窗口。
+            // 冷启动时把主窗口带到前台。在后台运行时再次打开 EchoPad（例如在"应用程序"里双击），也显示窗口。
             RunEvent::Ready | RunEvent::Reopen { .. } => show_main_window(app),
             _ => {}
         });
 }
 
-/// 菜单栏图标：左键点击打开窗口，右键点击是菜单（重新打开窗口或者退出电脑端）。
+/// 菜单栏图标：左键点击打开窗口；右键点击是菜单，可以重新打开窗口、让在线的手机端切换过来、退出电脑端。
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "打开 EchoPad", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let icon = app.default_window_icon().cloned().expect("the app icon is bundled");
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .tooltip("EchoPad")
-        .menu(&Menu::with_items(app, &[&open, &quit])?)
+        .menu(&tray_menu(app.handle(), &[])?)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
@@ -205,18 +225,58 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
             "quit" => app.exit(0),
-            _ => {}
+            id => {
+                if let Some(phone_id) = id.strip_prefix(SWITCH_MENU_PREFIX) {
+                    app.state::<AppState>().server.request_switch(phone_id);
+                }
+            }
         })
         .build(app)?;
     Ok(())
 }
 
+/// 右键菜单：每部在线的手机端一项"让它控制这台电脑"。
+fn tray_menu(app: &AppHandle, phones: &[PhoneStatus]) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+    menu.append(&MenuItem::with_id(app, "open", "打开 EchoPad", true, None::<&str>)?)?;
+    for phone in phones.iter().filter(|phone| phone.online) {
+        let id = format!("{SWITCH_MENU_PREFIX}{}", phone.id);
+        menu.append(&MenuItem::with_id(app, id, format!("让 {} 控制这台电脑", phone.name), true, None::<&str>)?)?;
+    }
+    menu.append(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)?;
+    Ok(menu)
+}
+
+/// 在线的手机端变了时重建右键菜单。
+fn update_tray_menu(app: &AppHandle, phones: &[PhoneStatus]) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    match tray_menu(app, phones) {
+        Ok(menu) => {
+            if let Err(err) = tray.set_menu(Some(menu)) {
+                tracing::warn!("failed to update the tray menu: {err}");
+            }
+        }
+        Err(err) => tracing::warn!("failed to build the tray menu: {err}"),
+    }
+}
+
+/// 主窗口打开时程序坞里有图标；关掉窗口后只留在菜单栏。
 fn show_main_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn hide_main_window(window: &tauri::Window) {
+    let _ = window.hide();
+    #[cfg(target_os = "macos")]
+    let _ = window.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
 }
 
 /// 手机端显示的电脑名称：macOS 上用「系统设置 › 通用 › 关于本机」里的名称。
@@ -230,23 +290,34 @@ fn desktop_name() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
-fn build_state(app: &tauri::AppHandle) -> anyhow::Result<AppState> {
+fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerConfig>)> {
     let config_dir = app.path().app_config_dir()?;
+    let certificate = DesktopCertificate::load_or_create(&config_dir)?;
     let pairing = PairingStore::load(config_dir.join("paired-devices.json"))?;
     let settings = SettingsStore::load(config_dir.join("settings.json"))?;
     let host = local_ip_address::local_ip().context("failed to find the LAN address")?;
 
-    let emitter = app.clone();
-    let status = Arc::new(StatusHub::new(pairing_link(host, PORT, pairing.pairing_token()), false, move |status| {
-        let _ = emitter.emit("status-changed", status);
+    let handle = app.clone();
+    // 右键菜单只在在线的手机端变了时重建。
+    let online_phones = Mutex::new(Vec::new());
+    let status = Arc::new(StatusHub::new(move |status| {
+        let _ = handle.emit("status-changed", status);
+        let online: Vec<_> = status.phones.iter().filter(|phone| phone.online).cloned().collect();
+        let mut previous = online_phones.lock().unwrap();
+        if *previous != online {
+            update_tray_menu(&handle, &online);
+            *previous = online;
+        }
     }));
     let permission_status = status.clone();
     let input = InputController::spawn(move |granted| permission_status.set_input_permission(granted));
 
-    Ok(AppState {
-        server: Arc::new(ServerContext::new(desktop_name(), host, pairing, status, Arc::new(input))),
+    let server = ServerContext::new(desktop_name(), host, certificate.fingerprint(), pairing, status, Arc::new(input));
+    let state = AppState {
+        server: Arc::new(server),
         settings,
-    })
+    };
+    Ok((state, certificate.server_config()?))
 }
 
 #[cfg(test)]
@@ -266,9 +337,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("echopad-app-{}", uuid::Uuid::new_v4()));
         let host = IpAddr::from(Ipv4Addr::LOCALHOST);
         let pairing = PairingStore::load(dir.join("paired-devices.json")).unwrap();
-        let status = Arc::new(StatusHub::new(pairing_link(host, PORT, pairing.pairing_token()), false, |_| {}));
+        let status = Arc::new(StatusHub::new(|_| {}));
         AppState {
-            server: Arc::new(ServerContext::new("Mac".into(), host, pairing, status, Arc::new(IgnoredInput))),
+            server: Arc::new(ServerContext::new(
+                "Mac".into(),
+                host,
+                "fingerprint".into(),
+                pairing,
+                status,
+                Arc::new(IgnoredInput),
+            )),
             settings: SettingsStore::load(dir.join("settings.json")).unwrap(),
         }
     }

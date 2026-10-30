@@ -1,16 +1,18 @@
 package com.wbbb.echopad.mobile.typing
 
 import com.wbbb.echopad.mobile.connection.DesktopConnection
+import com.wbbb.echopad.mobile.connection.FakeFinder
 import com.wbbb.echopad.mobile.connection.FakeSession
 import com.wbbb.echopad.mobile.connection.FakeTransport
 import com.wbbb.echopad.mobile.connection.MemoryStore
-import com.wbbb.echopad.mobile.pairing.PairedDesktop
+import com.wbbb.echopad.mobile.connection.pairedDesktop
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.KeyPress
 import com.wbbb.echopad.mobile.protocol.ServerMessage
 import com.wbbb.echopad.mobile.protocol.TypeText
 import com.wbbb.echopad.mobile.protocol.Welcome
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -23,8 +25,8 @@ class KeyboardInputTest {
 
     /** 已连接的手机键盘，以及电脑端这一侧。 */
     private suspend fun TestScope.connectedKeyboard(): Pair<KeyboardInput, FakeSession> {
-        val store = MemoryStore(PairedDesktop("192.168.1.2", 47321, "device-key", "Mac"))
-        val connection = DesktopConnection(store, "Phone", transport, backgroundScope)
+        val store = MemoryStore(pairedDesktop())
+        val connection = DesktopConnection(store, "Phone", transport, backgroundScope, FakeFinder(), MutableSharedFlow())
         val session = transport.sessions.receive()
         session.hello()
         session.reply(ServerMessage(welcome = Welcome(desktop_name = "Mac")))

@@ -1,6 +1,7 @@
 package com.wbbb.echopad.mobile.touchpad
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
@@ -64,8 +65,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wbbb.echopad.mobile.connection.ConnectionState
 import com.wbbb.echopad.mobile.connection.DesktopConnection
+import com.wbbb.echopad.mobile.connection.DesktopEntry
 import com.wbbb.echopad.mobile.dictation.DictationController
 import com.wbbb.echopad.mobile.dictation.rememberAudioCapture
+import com.wbbb.echopad.mobile.pairing.ScanOverlay
 import com.wbbb.echopad.mobile.typing.KeyboardInput
 import com.wbbb.echopad.mobile.typing.KeyboardPanel
 import com.wbbb.echopad.mobile.typing.MediaPanel
@@ -90,12 +93,18 @@ fun TouchpadScreen(
     keyboard: KeyboardInput,
     speed: TouchpadSpeed,
     onSpeedChange: (TouchpadSpeed) -> Unit,
+    onScanned: (String) -> Unit,
     onNotice: (String) -> Unit,
 ) {
     val connected = state is ConnectionState.Connected
     // 转屏后展开的面板保持不变。
     var panel by rememberSaveable { mutableStateOf<Panel?>(null) }
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
+    var desktopsOpen by rememberSaveable { mutableStateOf(false) }
+    var scanning by rememberSaveable { mutableStateOf(false) }
+    val desktops by connection.desktops.collectAsStateWithLifecycle()
+    val activeId by connection.activeId.collectAsStateWithLifecycle()
+    val activeName = desktops.find { it.id == activeId }?.name
     val output = remember(connection) { TouchpadOutput { connection.send(it) } }
     SideEffect { output.speed = speed }
 
@@ -110,9 +119,14 @@ fun TouchpadScreen(
     val togglePanel = { target: Panel -> panel = if (panel == target) null else target }
     val connectionLabel = @Composable { modifier: Modifier ->
         ConnectionLabel(
-            label = (state as? ConnectionState.Connected)?.desktopName?.ifEmpty { "已连接" } ?: "正在连接…",
+            label = when {
+                state is ConnectionState.Connected -> state.desktopName.ifEmpty { "已连接" }
+                activeName != null -> "正在连接 $activeName"
+                else -> "正在连接…"
+            },
             connected = connected,
-            modifier = modifier,
+            // 点电脑名打开电脑列表，在那里切换、取消配对或添加电脑。
+            modifier = modifier.clickable { desktopsOpen = true },
         )
     }
     val settingsButton = @Composable {
@@ -120,7 +134,6 @@ fun TouchpadScreen(
             Text("设置", color = EchoPadColors.TextMuted)
         }
     }
-    val disconnectButton = @Composable { DisconnectButton(onDisconnect = connection::unpair) }
     val mediaToggle = @Composable { PanelToggle("媒体", open = panel == Panel.Media) { togglePanel(Panel.Media) } }
     val keyboardToggle = @Composable { PanelToggle("键盘", open = panel == Panel.Keyboard) { togglePanel(Panel.Keyboard) } }
     val talkButton = @Composable { modifier: Modifier -> TalkButton(dictation, connected, onNotice, modifier) }
@@ -144,10 +157,9 @@ fun TouchpadScreen(
                         modifier = Modifier.width(200.dp).fillMaxHeight().padding(12.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        connectionLabel(Modifier.padding(start = 12.dp, top = 12.dp))
-                        Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            connectionLabel(Modifier.weight(1f).padding(start = 12.dp))
                             settingsButton()
-                            disconnectButton()
                         }
                         Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                             mediaToggle()
@@ -164,7 +176,6 @@ fun TouchpadScreen(
                 ) {
                     connectionLabel(Modifier.weight(1f))
                     settingsButton()
-                    disconnectButton()
                 }
                 TouchSurface(
                     output = output,
@@ -187,6 +198,32 @@ fun TouchpadScreen(
 
     if (settingsOpen) {
         SpeedSheet(speed = speed, onSpeedChange = onSpeedChange, onDismiss = { settingsOpen = false })
+    }
+    if (desktopsOpen) {
+        DesktopListSheet(
+            desktops = desktops,
+            activeId = activeId,
+            onSwitch = connection::switchTo,
+            onUnpair = connection::unpair,
+            onAdd = {
+                desktopsOpen = false
+                scanning = true
+            },
+            onDismiss = { desktopsOpen = false },
+        )
+    }
+    if (scanning) {
+        ScanOverlay(
+            onScanned = {
+                scanning = false
+                onScanned(it)
+            },
+            onUnavailable = {
+                scanning = false
+                onNotice("无法使用相机扫码")
+            },
+            onCancel = { scanning = false },
+        )
     }
 }
 
@@ -239,31 +276,75 @@ private fun ConnectionLabel(label: String, connected: Boolean, modifier: Modifie
     }
 }
 
-/** 断开连接前先确认：断开后要重新扫码配对。 */
+/** 配过的电脑列表：点一行切换到这台；取消配对前先确认；最下方添加电脑。 */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DisconnectButton(onDisconnect: () -> Unit) {
-    var confirming by rememberSaveable { mutableStateOf(false) }
-    TextButton(onClick = { confirming = true }) {
-        Text("断开连接", color = EchoPadColors.TextMuted)
+private fun DesktopListSheet(
+    desktops: List<DesktopEntry>,
+    activeId: String?,
+    onSwitch: (String) -> Unit,
+    onUnpair: (String) -> Unit,
+    onAdd: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var unpairing by remember { mutableStateOf<DesktopEntry?>(null) }
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = EchoPadColors.Surface) {
+        Column(Modifier.padding(bottom = 24.dp)) {
+            for (desktop in desktops) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            onSwitch(desktop.id)
+                            onDismiss()
+                        }
+                        .padding(start = 24.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(8.dp).clip(CircleShape)
+                            .background(if (desktop.online) EchoPadColors.Connected else EchoPadColors.TextMuted),
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        desktop.name,
+                        color = EchoPadColors.Text,
+                        style = MaterialTheme.typography.bodyLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (desktop.id == activeId) {
+                        Text("当前", color = EchoPadColors.TextMuted, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    TextButton(onClick = { unpairing = desktop }) {
+                        Text("取消配对", color = EchoPadColors.TextMuted)
+                    }
+                }
+            }
+            TextButton(onClick = onAdd, modifier = Modifier.padding(start = 12.dp, top = 8.dp)) {
+                Text("添加电脑", color = EchoPadColors.Text)
+            }
+        }
     }
-    if (confirming) {
+    unpairing?.let { desktop ->
         AlertDialog(
-            onDismissRequest = { confirming = false },
-            title = { Text("断开连接？") },
-            text = { Text("断开后需要重新扫码配对。") },
+            onDismissRequest = { unpairing = null },
+            title = { Text("取消和 ${desktop.name} 的配对？") },
+            text = { Text("之后要重新扫码才能再用。") },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        confirming = false
-                        onDisconnect()
+                        unpairing = null
+                        onUnpair(desktop.id)
                     },
                 ) {
-                    Text("断开", color = EchoPadColors.Text)
+                    Text("取消配对", color = EchoPadColors.Text)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { confirming = false }) {
-                    Text("取消", color = EchoPadColors.TextMuted)
+                TextButton(onClick = { unpairing = null }) {
+                    Text("保留", color = EchoPadColors.TextMuted)
                 }
             },
             containerColor = EchoPadColors.Surface,
@@ -286,9 +367,12 @@ private fun TouchSurface(output: TouchpadOutput, modifier: Modifier) {
     val scope = rememberCoroutineScope()
     var inertia by remember { mutableStateOf<Job?>(null) }
 
-    // 每帧屏幕刷新时把累积的指针移动和滚动合并发送一次。
+    // 有累积的指针移动和滚动时，在下一帧屏幕刷新时合并发送一次；手指不动时不占用屏幕刷新。
     LaunchedEffect(output) {
-        while (true) withFrameMillis { output.flush() }
+        while (true) {
+            output.awaitPending()
+            withFrameMillis { output.flush() }
+        }
     }
 
     Box(

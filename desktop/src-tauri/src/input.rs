@@ -8,8 +8,8 @@ use std::{
 
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 
-/// 缺少辅助功能权限时，每隔这么久重新检查一次，用户授权后无需重启电脑端。
-const PERMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// 每隔这么久检查一次辅助功能权限：用户授权后无需重启电脑端；使用中被关掉时界面也会更新。
+const PERMISSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -54,27 +54,30 @@ pub enum Shortcut {
     SwitchApp,
 }
 
+/// 发出操作的那条连接。多部手机端同时连着时，按它分开记录按住的鼠标键和进行中的缩放（ADR-0015）。
+pub type Owner = u64;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputCommand {
     /// 指针的相对位移，单位为屏幕上的点。
     Move { dx: f32, dy: f32 },
     Click(MouseButton),
     DoubleClick(MouseButton),
-    Press(MouseButton),
-    Release(MouseButton),
+    Press { owner: Owner, button: MouseButton },
+    Release { owner: Owner, button: MouseButton },
     /// 双指滑动的距离，单位为像素，内容跟随手指移动。
     Scroll { dx: f32, dy: f32 },
     /// 双指捏合缩放开始，之后的缩放和结束都属于这一次。
-    ZoomStart,
+    ZoomStart { owner: Owner },
     /// 两指距离的变化比例减 1：放大为正，缩小为负。
-    Zoom { magnification: f32 },
-    ZoomEnd,
+    Zoom { owner: Owner, magnification: f32 },
+    ZoomEnd { owner: Owner },
     /// 在插入点输入文字。
     Text(String),
     Key(SpecialKey),
     Shortcut(Shortcut),
-    /// 松开所有被按住的鼠标键、结束进行中的缩放，在连接断开时使用。
-    ReleaseAll,
+    /// 松开这条连接按住的鼠标键、结束它进行中的缩放，在连接断开时使用。
+    ReleaseAll { owner: Owner },
 }
 
 /// 输入命令的去处。实际实现转给输入线程，测试里可以替换。
@@ -109,9 +112,10 @@ struct InputWorker<F> {
     device: Device<F>,
     pending_move: Fraction,
     pending_scroll: Fraction,
-    held: Vec<MouseButton>,
-    /// 已经发出缩放开始、还没有发出结束。
-    zooming: bool,
+    /// 每条连接按住的鼠标键。同一个键被几条连接按着时，最后一条松开才真正松开。
+    held: Vec<(Owner, MouseButton)>,
+    /// 正在缩放的连接：已经发出缩放开始、还没有发出结束。
+    zooming: Option<Owner>,
 }
 
 impl<F: Fn(bool)> InputWorker<F> {
@@ -126,7 +130,7 @@ impl<F: Fn(bool)> InputWorker<F> {
             pending_move: Fraction::default(),
             pending_scroll: Fraction::default(),
             held: Vec::new(),
-            zooming: false,
+            zooming: None,
         }
     }
 
@@ -134,21 +138,14 @@ impl<F: Fn(bool)> InputWorker<F> {
         // 启动时就检查一次权限，让界面尽早显示授权状态。
         self.device.get();
         loop {
-            // 缺少权限时不等手机端发来操作，到时间就重新检查，用户授权后界面立即更新。
-            let received = if self.device.is_ready() {
-                commands.recv().map_err(|_| RecvTimeoutError::Disconnected)
-            } else {
-                commands.recv_timeout(PERMISSION_RETRY_INTERVAL)
-            };
-            match received {
+            // 不等手机端发来操作，到时间就检查权限，授权或被关掉都会立即反映到界面上。
+            match commands.recv_timeout(PERMISSION_CHECK_INTERVAL) {
                 Ok(command) => {
                     if let Err(err) = self.handle(command) {
                         tracing::warn!("input command failed: {err}");
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    self.device.get();
-                }
+                Err(RecvTimeoutError::Timeout) => self.device.refresh(),
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
@@ -179,19 +176,20 @@ impl<F: Fn(bool)> InputWorker<F> {
                     enigo.button(button.into(), Direction::Click)?;
                 }
             }
-            InputCommand::Press(button) => {
+            InputCommand::Press { owner, button } => {
+                let pressed = self.is_held(button);
                 if let Some(enigo) = self.device.get() {
-                    enigo.button(button.into(), Direction::Press)?;
-                    if !self.held.contains(&button) {
-                        self.held.push(button);
+                    if !pressed {
+                        enigo.button(button.into(), Direction::Press)?;
+                    }
+                    if !self.held.contains(&(owner, button)) {
+                        self.held.push((owner, button));
                     }
                 }
             }
-            InputCommand::Release(button) => {
-                self.held.retain(|held| *held != button);
-                if let Some(enigo) = self.device.get() {
-                    enigo.button(button.into(), Direction::Release)?;
-                }
+            InputCommand::Release { owner, button } => {
+                self.held.retain(|held| *held != (owner, button));
+                self.release_if_unheld(button)?;
             }
             InputCommand::Scroll { dx, dy } => {
                 let (x, y) = self.pending_scroll.take_whole(dx, dy);
@@ -205,20 +203,24 @@ impl<F: Fn(bool)> InputWorker<F> {
                     }
                 }
             }
-            InputCommand::ZoomStart => {
+            InputCommand::ZoomStart { owner } => {
                 // 上一次缩放没收到结束（比如手机端的触控区被关掉了），先把它结束，保证每次缩放都有开始和结束。
                 self.end_zoom();
                 if self.device.get().is_some() {
                     post_zoom(ZoomPhase::Began, 0.0);
-                    self.zooming = true;
+                    self.zooming = Some(owner);
                 }
             }
-            InputCommand::Zoom { magnification } => {
-                if self.zooming {
+            InputCommand::Zoom { owner, magnification } => {
+                if self.zooming == Some(owner) {
                     post_zoom(ZoomPhase::Changed, magnification.into());
                 }
             }
-            InputCommand::ZoomEnd => self.end_zoom(),
+            InputCommand::ZoomEnd { owner } => {
+                if self.zooming == Some(owner) {
+                    self.end_zoom();
+                }
+            }
             InputCommand::Text(text) => {
                 if let Some(enigo) = self.device.get() {
                     enigo.text(&text)?;
@@ -235,21 +237,36 @@ impl<F: Fn(bool)> InputWorker<F> {
                     chord(enigo, &modifiers, key)?;
                 }
             }
-            InputCommand::ReleaseAll => {
-                self.end_zoom();
-                let held = std::mem::take(&mut self.held);
-                if let Some(enigo) = self.device.get() {
-                    for button in held {
-                        enigo.button(button.into(), Direction::Release)?;
-                    }
+            InputCommand::ReleaseAll { owner } => {
+                if self.zooming == Some(owner) {
+                    self.end_zoom();
+                }
+                let (released, kept) = std::mem::take(&mut self.held).into_iter().partition(|(held_by, _)| *held_by == owner);
+                self.held = kept;
+                for (_, button) in released {
+                    self.release_if_unheld(button)?;
                 }
             }
         }
         Ok(())
     }
 
+    fn is_held(&self, button: MouseButton) -> bool {
+        self.held.iter().any(|(_, held)| *held == button)
+    }
+
+    /// 没有别的连接还按着这个键时，才真正松开它。
+    fn release_if_unheld(&mut self, button: MouseButton) -> enigo::InputResult<()> {
+        if !self.is_held(button)
+            && let Some(enigo) = self.device.get()
+        {
+            enigo.button(button.into(), Direction::Release)?;
+        }
+        Ok(())
+    }
+
     fn end_zoom(&mut self) {
-        if std::mem::take(&mut self.zooming) {
+        if self.zooming.take().is_some() {
             post_zoom(ZoomPhase::Ended, 0.0);
         }
     }
@@ -264,14 +281,19 @@ struct Device<F> {
 }
 
 impl<F: Fn(bool)> Device<F> {
-    fn is_ready(&self) -> bool {
-        self.enigo.is_some()
+    fn refresh(&mut self) {
+        if self.enigo.is_some() && !permission_granted() {
+            // 使用中被关掉了辅助功能权限：放弃当前的 enigo，等用户重新授权后再创建。
+            self.enigo = None;
+            self.report(false);
+        }
+        self.get();
     }
 
     fn get(&mut self) -> Option<&mut Enigo> {
         let due = self
             .last_attempt
-            .is_none_or(|attempt| attempt.elapsed() >= PERMISSION_RETRY_INTERVAL);
+            .is_none_or(|attempt| attempt.elapsed() >= PERMISSION_CHECK_INTERVAL);
         if self.enigo.is_none() && due {
             // 只在第一次尝试时弹出系统授权提示，之后静默重试，等用户授权。
             let settings = Settings {
@@ -283,14 +305,25 @@ impl<F: Fn(bool)> Device<F> {
                 Ok(enigo) => self.enigo = Some(enigo),
                 Err(err) => tracing::warn!("input simulation unavailable: {err}"),
             }
-            let granted = self.enigo.is_some();
-            if self.permission != Some(granted) {
-                self.permission = Some(granted);
-                (self.on_permission)(granted);
-            }
+            self.report(self.enigo.is_some());
         }
         self.enigo.as_mut()
     }
+
+    fn report(&mut self, granted: bool) {
+        if self.permission != Some(granted) {
+            self.permission = Some(granted);
+            (self.on_permission)(granted);
+        }
+    }
+}
+
+/// macOS 上模拟键鼠需要辅助功能权限，其他系统不需要。
+fn permission_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    return unsafe { objc2_application_services::AXIsProcessTrusted() };
+    #[cfg(not(target_os = "macos"))]
+    true
 }
 
 /// 累积不足一个单位的位移，避免慢速移动时被取整丢掉。
