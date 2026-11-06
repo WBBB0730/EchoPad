@@ -2,8 +2,10 @@ package com.wbbb.echopad.mobile.touchpad
 
 import com.wbbb.echopad.mobile.protocol.ButtonAction
 import com.wbbb.echopad.mobile.protocol.ClientMessage
+import com.wbbb.echopad.mobile.protocol.ModifierKey
 import com.wbbb.echopad.mobile.protocol.MouseButton
 import com.wbbb.echopad.mobile.protocol.Zoom
+import com.wbbb.echopad.mobile.typing.ModifierKeys
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runCurrent
@@ -15,11 +17,13 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TouchpadOutputTest {
     private val sent = mutableListOf<ClientMessage>()
-    private val output = TouchpadOutput { sent += it }
+    private val modifiers = ModifierKeys()
+    private val output = TouchpadOutput(modifiers) { sent += it }
 
     @Test
     fun aFrameIsOnlyNeededOnceMovementAccumulates() = runTest {
@@ -59,6 +63,38 @@ class TouchpadOutputTest {
             ButtonAction(button = MouseButton.MOUSE_BUTTON_LEFT, kind = ButtonAction.Kind.KIND_CLICK),
             sent[1].button_action,
         )
+    }
+
+    @Test
+    fun clicksAndDragsCarryTheActiveModifiers() {
+        modifiers.lock(ModifierKey.MODIFIER_KEY_META)
+        output.handle(TouchpadAction.LeftClick)
+        output.handle(TouchpadAction.DragStart)
+        output.handle(TouchpadAction.DragEnd)
+        modifiers.releaseAll()
+        output.handle(TouchpadAction.RightClick)
+
+        val meta = listOf(ModifierKey.MODIFIER_KEY_META)
+        assertEquals(
+            listOf(
+                ButtonAction(button = MouseButton.MOUSE_BUTTON_LEFT, kind = ButtonAction.Kind.KIND_CLICK, modifiers = meta),
+                ButtonAction(button = MouseButton.MOUSE_BUTTON_LEFT, kind = ButtonAction.Kind.KIND_PRESS, modifiers = meta),
+                // 拖拽开始时按下的修饰键由电脑端在松开时一起松开。
+                ButtonAction(button = MouseButton.MOUSE_BUTTON_LEFT, kind = ButtonAction.Kind.KIND_RELEASE),
+                ButtonAction(button = MouseButton.MOUSE_BUTTON_RIGHT, kind = ButtonAction.Kind.KIND_CLICK),
+            ),
+            sent.map { it.button_action },
+        )
+    }
+
+    @Test
+    fun movementAndScrollingDoNotUseUpALatchedModifier() {
+        modifiers.tap(ModifierKey.MODIFIER_KEY_SHIFT, 300.milliseconds)
+        output.handle(TouchpadAction.Move(1f, 0f, 100))
+        output.scroll(0f, 4f)
+        output.flush()
+
+        assertEquals(listOf(ModifierKey.MODIFIER_KEY_SHIFT), modifiers.consume())
     }
 
     @Test

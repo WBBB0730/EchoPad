@@ -190,9 +190,10 @@ pub fn run() {
                 Ok(daemon) => {
                     let server = server.clone();
                     tauri::async_runtime::spawn(async move {
-                        let refresh = || match local_ip_address::local_ip() {
-                            Ok(host) => server.update_host(host),
-                            Err(err) => tracing::debug!("no LAN address: {err}"),
+                        // 暂时没有局域网时（例如正在换 Wi-Fi），配对码保持原来的地址。
+                        let refresh = || match discovery::lan_address() {
+                            Some(host) => server.update_host(host),
+                            None => tracing::debug!("no LAN address"),
                         };
                         if let Err(err) = discovery::watch_addresses(&daemon, refresh).await {
                             tracing::warn!("stopped watching network changes: {err:#}");
@@ -326,7 +327,7 @@ fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerCo
     let certificate = DesktopCertificate::load_or_create(&config_dir)?;
     let pairing = PairingStore::load(config_dir.join("paired-devices.json"))?;
     let settings = SettingsStore::load(config_dir.join("settings.json"))?;
-    let host = local_ip_address::local_ip().context("failed to find the LAN address")?;
+    let host = discovery::lan_address().context("failed to find the LAN address")?;
 
     let handle = app.clone();
     // 右键菜单只在在线的手机端变了时重建。
@@ -341,7 +342,15 @@ fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerCo
         }
     }));
     let permission_status = status.clone();
-    let input = InputController::spawn(move |granted| permission_status.set_input_permission(granted));
+    let main_thread = app.clone();
+    let input = InputController::spawn(
+        move |granted| permission_status.set_input_permission(granted),
+        move |task| {
+            if let Err(err) = main_thread.run_on_main_thread(task) {
+                tracing::warn!("failed to run on the main thread: {err}");
+            }
+        },
+    );
 
     let server = ServerContext::new(desktop_name(), host, certificate.fingerprint(), pairing, status, Arc::new(input));
     let state = AppState {

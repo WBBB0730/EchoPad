@@ -2,17 +2,20 @@ package com.wbbb.echopad.mobile.touchpad
 
 import com.wbbb.echopad.mobile.protocol.ButtonAction
 import com.wbbb.echopad.mobile.protocol.ClientMessage
+import com.wbbb.echopad.mobile.protocol.ModifierKey
 import com.wbbb.echopad.mobile.protocol.MouseButton
 import com.wbbb.echopad.mobile.protocol.PointerMove
 import com.wbbb.echopad.mobile.protocol.Scroll
 import com.wbbb.echopad.mobile.protocol.Zoom
+import com.wbbb.echopad.mobile.typing.ModifierKeys
 import kotlinx.coroutines.channels.Channel
 
 /**
  * 把手势换算成发给电脑端的消息。指针移动、滚动和缩放先累积，有累积时在下一帧屏幕刷新时由 [flush] 合并发送一次；
  * 按键操作和缩放的开始、结束立即发送，并先发出之前累积的移动，保证顺序不乱。
+ * 单击、右键和拖拽开始时带上生效的修饰键（docs/prd/typing.md）；移动、滚动和缩放不带。
  */
-class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
+class TouchpadOutput(private val modifiers: ModifierKeys, private val send: (ClientMessage) -> Unit) {
     /** 用户设置的指针速度和滚动速度。 */
     var speed = TouchpadSpeed()
 
@@ -39,9 +42,10 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
             }
             is TouchpadAction.Scroll -> scroll(action.dx, action.dy)
             is TouchpadAction.Fling -> Unit
-            TouchpadAction.LeftClick -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_CLICK)
-            TouchpadAction.RightClick -> button(MouseButton.MOUSE_BUTTON_RIGHT, ButtonAction.Kind.KIND_CLICK)
-            TouchpadAction.DragStart -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_PRESS)
+            TouchpadAction.LeftClick -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_CLICK, modifiers.consume())
+            TouchpadAction.RightClick -> button(MouseButton.MOUSE_BUTTON_RIGHT, ButtonAction.Kind.KIND_CLICK, modifiers.consume())
+            TouchpadAction.DragStart -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_PRESS, modifiers.consume())
+            // 拖拽开始时按下的修饰键由电脑端在松开时一起松开（ADR-0016）。
             TouchpadAction.DragEnd -> button(MouseButton.MOUSE_BUTTON_LEFT, ButtonAction.Kind.KIND_RELEASE)
             TouchpadAction.ZoomStart -> zoom(Zoom.Phase.PHASE_BEGAN)
             is TouchpadAction.Zoom -> {
@@ -76,9 +80,9 @@ class TouchpadOutput(private val send: (ClientMessage) -> Unit) {
         }
     }
 
-    private fun button(button: MouseButton, kind: ButtonAction.Kind) {
+    private fun button(button: MouseButton, kind: ButtonAction.Kind, modifiers: List<ModifierKey> = emptyList()) {
         flush()
-        send(ClientMessage(button_action = ButtonAction(button = button, kind = kind)))
+        send(ClientMessage(button_action = ButtonAction(button = button, kind = kind, modifiers = modifiers)))
     }
 
     private fun zoom(phase: Zoom.Phase) {

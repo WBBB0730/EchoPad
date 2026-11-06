@@ -31,7 +31,7 @@ import kotlinx.coroutines.flow.emptyFlow
 fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
     val viewModel = viewModel { EchoPadViewModel(platform) }
     val state by viewModel.connection.state.collectAsStateWithLifecycle()
-    val touchpadSpeed by viewModel.touchpadSpeed.collectAsStateWithLifecycle()
+    val touchpadSettings by viewModel.touchpadSettings.collectAsStateWithLifecycle()
     val update = viewModel.updater?.state?.collectAsStateWithLifecycle()?.value
     val snackbar = remember { SnackbarHostState() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -61,8 +61,8 @@ fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
                         connection = viewModel.connection,
                         dictation = viewModel.dictation,
                         keyboard = viewModel.keyboard,
-                        speed = touchpadSpeed,
-                        onSpeedChange = viewModel::setTouchpadSpeed,
+                        settings = touchpadSettings,
+                        onSettingsChange = viewModel::setTouchpadSettings,
                         onScanned = viewModel::onPairingLink,
                         onNotice = viewModel::notify,
                         update = update,

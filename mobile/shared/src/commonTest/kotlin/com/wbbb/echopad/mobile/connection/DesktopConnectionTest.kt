@@ -5,6 +5,7 @@ import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.pairing.SavedPairing
 import com.wbbb.echopad.mobile.protocol.ClientMessage
+import com.wbbb.echopad.mobile.protocol.OperatingSystem
 import com.wbbb.echopad.mobile.protocol.PointerMove
 import com.wbbb.echopad.mobile.protocol.Rejected
 import com.wbbb.echopad.mobile.protocol.ServerMessage
@@ -51,9 +52,18 @@ class DesktopConnectionTest {
         assertEquals("token", hello.pairing_token)
         assertEquals("phone-1", hello.phone_id)
 
-        session.reply(ServerMessage(welcome = Welcome(desktop_name = "Office Mac", device_key = "new-key", desktop_id = "desk-9")))
+        session.reply(
+            ServerMessage(
+                welcome = Welcome(
+                    desktop_name = "Office Mac",
+                    device_key = "new-key",
+                    desktop_id = "desk-9",
+                    operating_system = OperatingSystem.OPERATING_SYSTEM_MACOS,
+                ),
+            ),
+        )
         runCurrent()
-        assertEquals(ConnectionState.Connected("Office Mac"), connection.state.value)
+        assertEquals(ConnectionState.Connected("Office Mac", OperatingSystem.OPERATING_SYSTEM_MACOS), connection.state.value)
         assertEquals(listOf(PairedDesktop("desk-9", "Office Mac", "192.168.1.9", 47321, "new-key", "fingerprint-9")), store.desktops)
         assertEquals("desk-9", store.activeId)
     }
@@ -107,7 +117,7 @@ class DesktopConnectionTest {
 
         assertEquals(office.id, connection.activeId.value)
         assertEquals(office.id, store.activeId)
-        assertEquals(ConnectionState.Connected("Office"), connection.state.value)
+        assertEquals(ConnectionState.Connected("Office", OperatingSystem.OPERATING_SYSTEM_UNSPECIFIED), connection.state.value)
         assertTrue(connection.send(move))
         runCurrent()
         assertEquals(move, ClientMessage.ADAPTER.decode(officeSession.sent.receive()))
@@ -134,7 +144,7 @@ class DesktopConnectionTest {
     fun reconnectsWithTheDeviceKeyAfterTheConnectionDrops() = runTest {
         val connection = connect(MemoryStore(home))
         val first = welcome(transport.sessions.receive(), "Mac")
-        assertEquals(ConnectionState.Connected("Mac"), connection.state.value)
+        assertEquals(ConnectionState.Connected("Mac", OperatingSystem.OPERATING_SYSTEM_UNSPECIFIED), connection.state.value)
 
         first.drop()
         runCurrent()
@@ -173,7 +183,7 @@ class DesktopConnectionTest {
         val second = transport.sessions.receive()
         assertEquals(ConnectionState.VersionMismatch(OutdatedApp.Desktop), connection.state.value)
         welcome(second, "Mac")
-        assertEquals(ConnectionState.Connected("Mac"), connection.state.value)
+        assertEquals(ConnectionState.Connected("Mac", OperatingSystem.OPERATING_SYSTEM_UNSPECIFIED), connection.state.value)
     }
 
     @Test
@@ -294,7 +304,7 @@ class DesktopConnectionTest {
         runCurrent()
         assertFalse(session.closed)
         assertTrue(transport.sessions.tryReceive().isFailure)
-        assertEquals(ConnectionState.Connected("Mac"), connection.state.value)
+        assertEquals(ConnectionState.Connected("Mac", OperatingSystem.OPERATING_SYSTEM_UNSPECIFIED), connection.state.value)
 
         // 断线后重新查找，立即连广播的新地址。
         session.drop()
@@ -342,7 +352,7 @@ class DesktopConnectionTest {
 
         assertFalse(session.closed)
         assertTrue(transport.sessions.tryReceive().isFailure)
-        assertEquals(ConnectionState.Connected("Mac"), connection.state.value)
+        assertEquals(ConnectionState.Connected("Mac", OperatingSystem.OPERATING_SYSTEM_UNSPECIFIED), connection.state.value)
     }
 
     @Test

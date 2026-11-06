@@ -79,6 +79,18 @@ class GestureRecognizerTest {
     }
 
     @Test
+    fun traditionalDirectionScrollsAndFlingsAgainstTheFinger() {
+        val recognizer = GestureRecognizer(ScrollDirection.Traditional)
+        recognizer.down(1, 0f, 0f, 0)
+        recognizer.down(2, 10f, 0f, 10)
+
+        // 传统方向：手指往下页面往下翻，左右也一样反过来。
+        assertEquals(listOf(Scroll(0f, -10f)), recognizer.move(mapOf(1L to TouchPoint(0f, 10f), 2L to TouchPoint(10f, 10f)), 26))
+        assertEquals(listOf(Scroll(-10f, -10f)), recognizer.move(mapOf(1L to TouchPoint(10f, 20f), 2L to TouchPoint(20f, 20f)), 42))
+        assertEquals(listOf(Fling(-0.625f, -1.25f)), recognizer.up(1, 10f, 20f, 50))
+    }
+
+    @Test
     fun aTwoFingerSlideScrollsAndFlings() {
         recognizer.down(1, 0f, 0f, 0)
         recognizer.down(2, 10f, 0f, 10)

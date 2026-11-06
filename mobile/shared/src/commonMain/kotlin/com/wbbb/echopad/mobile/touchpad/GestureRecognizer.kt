@@ -26,12 +26,12 @@ data class TouchPoint(val x: Float, val y: Float)
 /**
  * 把触控区上的手指事件识别成手势（docs/prd/touchpad.md）：
  * 单指滑动移动指针，轻点立即左键单击（连点两下由电脑识别成双击），按住不动一会儿再移动是拖拽，
- * 双指轻点右键，双指滑动滚动，双指张开或捏合缩放。三指及以上的手势第一版不处理。
+ * 双指轻点右键，双指滑动按 [scrollDirection] 滚动，双指张开或捏合缩放。三指及以上的手势第一版不处理。
  *
  * 按下后要等一小段时间，才能确定是不是要拖拽，等待的截止时间见 [deadline]，
  * 调用方需要在截止时间到达时调用 [timeout]。时间单位为毫秒，坐标单位为 dp。
  */
-class GestureRecognizer {
+class GestureRecognizer(private val scrollDirection: ScrollDirection = ScrollDirection.Natural) {
     var deadline: Long? = null
         private set
 
@@ -91,10 +91,10 @@ class GestureRecognizer {
                 val gesture = current.gesture ?: decide(current.origins)
                 when (gesture) {
                     TwoFingerGesture.Scroll -> {
-                        val dx = centroid.x - current.centroid.x
-                        val dy = centroid.y - current.centroid.y
+                        val dx = scrollDirection.apply(centroid.x - current.centroid.x)
+                        val dy = scrollDirection.apply(centroid.y - current.centroid.y)
                         actions += TouchpadAction.Scroll(dx, dy)
-                        current.samples.add(Sample(time, dx, dy))
+                        current.fling.add(time, dx, dy)
                     }
                     TwoFingerGesture.Zoom -> {
                         if (current.gesture == null) actions += TouchpadAction.ZoomStart
@@ -143,7 +143,7 @@ class GestureRecognizer {
             is State.TwoFingers -> {
                 when (current.gesture) {
                     null -> if (time - current.startTime <= TWO_FINGER_TAP_TIMEOUT) actions += TouchpadAction.RightClick
-                    TwoFingerGesture.Scroll -> flingVelocity(current.samples, time)?.let { actions += it }
+                    TwoFingerGesture.Scroll -> current.fling.release(time)?.let { actions += it }
                     TwoFingerGesture.Zoom -> actions += TouchpadAction.ZoomEnd
                 }
                 if (pointers.isEmpty()) State.Idle else State.Ignoring
@@ -198,15 +198,13 @@ class GestureRecognizer {
             val spread: Float,
             /** 判定出的手势，判定后到手指离开都不变；还没超出轻点范围时为空。 */
             val gesture: TwoFingerGesture? = null,
-            val samples: MutableList<Sample> = mutableListOf(),
+            val fling: FlingTracker = FlingTracker(),
         ) : State
         /** 三指及以上，或双指只抬起了一根：等所有手指离开后再重新开始识别。 */
         data object Ignoring : State
     }
 
     private enum class TwoFingerGesture { Scroll, Zoom }
-
-    private data class Sample(val time: Long, val dx: Float, val dy: Float)
 
     companion object {
         /** 移动不超过这个距离（dp）仍算轻点。 */
@@ -217,24 +215,38 @@ class GestureRecognizer {
         /** 双指中只有一根在动、移动超过这个距离（dp，约 4mm）时，当作滚动。 */
         const val ONE_FINGER_SCROLL_DISTANCE = 24f
 
-        /** 只用离开前这段时间内的滑动来估算速度。 */
-        private const val FLING_WINDOW = 100L
-        /** 离开前停顿超过这段时间，就不产生惯性。 */
-        private const val FLING_MAX_PAUSE = 50L
-        private const val MIN_FLING_SPEED = 0.1f
-
         private fun distance(a: TouchPoint, b: TouchPoint) = hypot(a.x - b.x, a.y - b.y)
 
         private fun moveAction(from: TouchPoint, to: TouchPoint, durationMillis: Long) =
             TouchpadAction.Move(to.x - from.x, to.y - from.y, durationMillis)
+    }
+}
 
-        private fun flingVelocity(samples: List<Sample>, time: Long): TouchpadAction.Fling? {
-            val recent = samples.filter { time - it.time <= FLING_WINDOW }
-            if (recent.isEmpty() || time - recent.last().time > FLING_MAX_PAUSE) return null
-            val span = (recent.last().time - recent.first().time).coerceAtLeast(16L).toFloat()
-            val vx = recent.sumOf { it.dx.toDouble() }.toFloat() / span
-            val vy = recent.sumOf { it.dy.toDouble() }.toFloat() / span
-            return if (hypot(vx, vy) >= MIN_FLING_SPEED) TouchpadAction.Fling(vx, vy) else null
-        }
+/** 记下一次滚动里每次触摸事件滚动的距离，手指离开时据此估算滚动惯性的初速度。 */
+internal class FlingTracker {
+    private val samples = mutableListOf<Sample>()
+
+    fun add(time: Long, dx: Float, dy: Float) {
+        samples += Sample(time, dx, dy)
+    }
+
+    /** 手指在 [time] 离开时的滑动速度；离开前停顿过久或滑得太慢时不产生惯性，返回空。 */
+    fun release(time: Long): TouchpadAction.Fling? {
+        val recent = samples.filter { time - it.time <= FLING_WINDOW }
+        if (recent.isEmpty() || time - recent.last().time > FLING_MAX_PAUSE) return null
+        val span = (recent.last().time - recent.first().time).coerceAtLeast(16L).toFloat()
+        val vx = recent.sumOf { it.dx.toDouble() }.toFloat() / span
+        val vy = recent.sumOf { it.dy.toDouble() }.toFloat() / span
+        return if (hypot(vx, vy) >= MIN_FLING_SPEED) TouchpadAction.Fling(vx, vy) else null
+    }
+
+    private data class Sample(val time: Long, val dx: Float, val dy: Float)
+
+    private companion object {
+        /** 只用离开前这段时间内的滑动来估算速度。 */
+        const val FLING_WINDOW = 100L
+        /** 离开前停顿超过这段时间，就不产生惯性。 */
+        const val FLING_MAX_PAUSE = 50L
+        const val MIN_FLING_SPEED = 0.1f
     }
 }

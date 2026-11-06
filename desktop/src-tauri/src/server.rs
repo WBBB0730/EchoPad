@@ -33,11 +33,11 @@ use tower_service::Service;
 
 use crate::{
     dictation::{DictationHandle, DictationService},
-    input::{InputCommand, InputSink, MouseButton, Owner, Shortcut, SpecialKey},
+    input::{InputCommand, InputSink, Modifier, MouseButton, Owner, Shortcut, SpecialKey},
     pairing::{AuthOutcome, Credential, DeviceId, PairingStore, pairing_link},
     protocol::{
-        self, ClientMessage, DictationFailed, Hello, Rejected, ServerMessage, SwitchRequest, Welcome,
-        button_action::Kind, client_message, hello, key_press, rejected, server_message, shortcut_action,
+        self, ClientMessage, DictationFailed, Hello, ModifierKey, OperatingSystem, Rejected, ServerMessage,
+        SwitchRequest, Welcome, button_action::Kind, client_message, hello, key_press, rejected, server_message, shortcut_action,
         zoom::Phase as ZoomPhase,
     },
     status::{OutdatedApp, PhoneStatus, StatusHub},
@@ -357,8 +357,16 @@ fn welcome(context: &ServerContext, device_key: String) -> server_message::Body 
         desktop_name: context.desktop_name.clone(),
         device_key,
         desktop_id: context.pairing.lock().unwrap().desktop_id().to_owned(),
+        operating_system: OPERATING_SYSTEM.into(),
     })
 }
+
+/// 手机端按它显示修饰键的名称。
+const OPERATING_SYSTEM: OperatingSystem = if cfg!(target_os = "macos") {
+    OperatingSystem::Macos
+} else {
+    OperatingSystem::Windows
+};
 
 fn dispatch(
     context: &ServerContext,
@@ -381,10 +389,11 @@ fn dispatch(
                 protocol::MouseButton::Right => MouseButton::Right,
                 protocol::MouseButton::Unspecified => return,
             };
+            let modifiers = modifiers(action.modifiers());
             let command = match action.kind() {
-                Kind::Click => InputCommand::Click(button),
-                Kind::DoubleClick => InputCommand::DoubleClick(button),
-                Kind::Press => InputCommand::Press { owner, button },
+                Kind::Click => InputCommand::Click { button, modifiers },
+                Kind::DoubleClick => InputCommand::DoubleClick { button, modifiers },
+                Kind::Press => InputCommand::Press { owner, button, modifiers },
                 Kind::Release => InputCommand::Release { owner, button },
                 Kind::Unspecified => return,
             };
@@ -445,7 +454,15 @@ fn dispatch(
         }
         Body::KeyPress(press) => {
             if let Some(key) = special_key(press.key()) {
-                context.input.send(InputCommand::Key(key));
+                let modifiers = modifiers(press.modifiers());
+                context.input.send(InputCommand::Key { key, modifiers });
+            }
+        }
+        Body::CharacterPress(press) => {
+            let mut characters = press.character.chars();
+            if let (Some(character), None) = (characters.next(), characters.next()) {
+                let modifiers = modifiers(press.modifiers());
+                context.input.send(InputCommand::Character { character, modifiers });
             }
         }
         Body::ShortcutAction(action) => {
@@ -481,6 +498,18 @@ fn special_key(key: key_press::Key) -> Option<SpecialKey> {
         Key::Mute => SpecialKey::Mute,
         Key::Unspecified => return None,
     })
+}
+
+fn modifiers(modifiers: impl Iterator<Item = ModifierKey>) -> Vec<Modifier> {
+    modifiers
+        .filter_map(|modifier| match modifier {
+            ModifierKey::Control => Some(Modifier::Control),
+            ModifierKey::Alt => Some(Modifier::Alt),
+            ModifierKey::Shift => Some(Modifier::Shift),
+            ModifierKey::Meta => Some(Modifier::Meta),
+            ModifierKey::Unspecified => None,
+        })
+        .collect()
 }
 
 fn shortcut(shortcut: shortcut_action::Shortcut) -> Option<Shortcut> {
@@ -526,8 +555,8 @@ mod tests {
         certificate::{CERTIFICATE_NAME, DesktopCertificate},
         dictation::{AudioFrame, Cleaner, Outbound, RecognitionEvent, run_pipeline},
         protocol::{
-            AudioChunk, ButtonAction, DictationCancel, DictationStart, DictationStop, KeyPress, PointerMove,
-            ShortcutAction, TypeText, Zoom,
+            AudioChunk, ButtonAction, CharacterPress, DictationCancel, DictationStart, DictationStop, KeyPress,
+            PointerMove, ShortcutAction, TypeText, Zoom,
         },
     };
 
@@ -769,10 +798,12 @@ mod tests {
         assert!(link.contains(&format!("fp={}", harness.context.fingerprint)));
 
         let (_, reply) = harness.connect("phone-1", hello::Credential::PairingToken(token.clone())).await;
-        let server_message::Body::Welcome(Welcome { desktop_name, device_key, desktop_id }) = reply else {
+        let server_message::Body::Welcome(welcome) = reply else {
             panic!("expected pairing to succeed, got {reply:?}");
         };
+        let Welcome { desktop_name, device_key, desktop_id, .. } = welcome.clone();
         assert_eq!(desktop_name, "Test Mac");
+        assert_eq!(welcome.operating_system(), OPERATING_SYSTEM);
         assert!(!device_key.is_empty());
         assert_eq!(desktop_id, harness.context.pairing.lock().unwrap().desktop_id());
         assert!(!harness.context.status.snapshot().pairing_link.contains(&token));
@@ -829,6 +860,7 @@ mod tests {
         let press = client_message::Body::ButtonAction(ButtonAction {
             button: protocol::MouseButton::Left.into(),
             kind: Kind::Press.into(),
+            ..Default::default()
         });
         send(&mut first, press.clone()).await;
         send(&mut second, press).await;
@@ -868,6 +900,7 @@ mod tests {
             client_message::Body::ButtonAction(ButtonAction {
                 button: protocol::MouseButton::Left.into(),
                 kind: Kind::Press.into(),
+                ..Default::default()
             }),
         )
         .await;
@@ -925,6 +958,7 @@ mod tests {
             client_message::Body::ButtonAction(ButtonAction {
                 button: protocol::MouseButton::Right.into(),
                 kind: Kind::Click.into(),
+                ..Default::default()
             }),
         )
         .await;
@@ -933,7 +967,7 @@ mod tests {
 
         assert_eq!(
             harness.input.commands()[..2],
-            [InputCommand::Move { dx: 3.0, dy: -2.0 }, InputCommand::Click(MouseButton::Right)]
+            [InputCommand::Move { dx: 3.0, dy: -2.0 }, InputCommand::Click { button: MouseButton::Right, modifiers: vec![] }]
         );
     }
 
@@ -981,6 +1015,7 @@ mod tests {
             client_message::Body::ButtonAction(ButtonAction {
                 button: protocol::MouseButton::Left.into(),
                 kind: Kind::Press.into(),
+                ..Default::default()
             }),
         )
         .await;
@@ -988,7 +1023,7 @@ mod tests {
         harness.wait_for_release_all().await;
 
         let commands = harness.input.commands();
-        let InputCommand::Press { owner, button: MouseButton::Left } = commands[0] else {
+        let InputCommand::Press { owner, button: MouseButton::Left, .. } = commands[0] else {
             panic!("expected a press, got {commands:?}");
         };
         assert_eq!(commands[1..], [InputCommand::ReleaseAll { owner }]);
@@ -1047,8 +1082,8 @@ mod tests {
         let mut client = paired_client(&harness).await;
 
         send(&mut client, client_message::Body::TypeText(TypeText { text: "你好 world".into() })).await;
-        send(&mut client, client_message::Body::KeyPress(KeyPress { key: key_press::Key::Enter.into() })).await;
-        send(&mut client, client_message::Body::KeyPress(KeyPress { key: key_press::Key::PlayPause.into() })).await;
+        send(&mut client, client_message::Body::KeyPress(KeyPress { key: key_press::Key::Enter.into(), ..Default::default() })).await;
+        send(&mut client, client_message::Body::KeyPress(KeyPress { key: key_press::Key::PlayPause.into(), ..Default::default() })).await;
         send(
             &mut client,
             client_message::Body::ShortcutAction(ShortcutAction { shortcut: shortcut_action::Shortcut::Paste.into() }),
@@ -1061,11 +1096,70 @@ mod tests {
             harness.input.commands()[..4],
             [
                 InputCommand::Text("你好 world".into()),
-                InputCommand::Key(SpecialKey::Enter),
-                InputCommand::Key(SpecialKey::PlayPause),
+                InputCommand::Key { key: SpecialKey::Enter, modifiers: vec![] },
+                InputCommand::Key { key: SpecialKey::PlayPause, modifiers: vec![] },
                 InputCommand::Shortcut(Shortcut::Paste),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn modifiers_reach_the_input_with_keys_characters_and_clicks() {
+        let harness = start_server(None).await;
+        let mut client = paired_client(&harness).await;
+        let modifiers = vec![ModifierKey::Meta.into(), ModifierKey::Shift.into()];
+
+        send(
+            &mut client,
+            client_message::Body::KeyPress(KeyPress { key: key_press::Key::Left.into(), modifiers: modifiers.clone() }),
+        )
+        .await;
+        send(
+            &mut client,
+            client_message::Body::CharacterPress(CharacterPress { character: "w".into(), modifiers: modifiers.clone() }),
+        )
+        .await;
+        // 不是一个字的不发送。
+        send(
+            &mut client,
+            client_message::Body::CharacterPress(CharacterPress { character: "ab".into(), modifiers: modifiers.clone() }),
+        )
+        .await;
+        send(
+            &mut client,
+            client_message::Body::ButtonAction(ButtonAction {
+                button: protocol::MouseButton::Left.into(),
+                kind: Kind::Click.into(),
+                modifiers: vec![ModifierKey::Meta.into()],
+            }),
+        )
+        .await;
+        send(
+            &mut client,
+            client_message::Body::ButtonAction(ButtonAction {
+                button: protocol::MouseButton::Left.into(),
+                kind: Kind::Press.into(),
+                modifiers: vec![ModifierKey::Alt.into()],
+            }),
+        )
+        .await;
+        client.close(None).await.unwrap();
+        harness.wait_for_release_all().await;
+
+        let commands = harness.input.commands();
+        let both = vec![Modifier::Meta, Modifier::Shift];
+        assert_eq!(
+            commands[..3],
+            [
+                InputCommand::Key { key: SpecialKey::Left, modifiers: both.clone() },
+                InputCommand::Character { character: 'w', modifiers: both },
+                InputCommand::Click { button: MouseButton::Left, modifiers: vec![Modifier::Meta] },
+            ]
+        );
+        assert!(matches!(
+            &commands[3],
+            InputCommand::Press { button: MouseButton::Left, modifiers, .. } if *modifiers == [Modifier::Alt]
+        ));
     }
 
     #[tokio::test]

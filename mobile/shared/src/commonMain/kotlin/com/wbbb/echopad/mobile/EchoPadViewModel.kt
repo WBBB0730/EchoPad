@@ -7,7 +7,7 @@ import com.wbbb.echopad.mobile.connection.DesktopConnection
 import com.wbbb.echopad.mobile.connection.KtorTransport
 import com.wbbb.echopad.mobile.dictation.DictationController
 import com.wbbb.echopad.mobile.pairing.PairingLink
-import com.wbbb.echopad.mobile.touchpad.TouchpadSpeed
+import com.wbbb.echopad.mobile.touchpad.TouchpadSettings
 import com.wbbb.echopad.mobile.typing.KeyboardInput
 import com.wbbb.echopad.mobile.update.AppUpdater
 import kotlinx.coroutines.flow.Flow
@@ -34,8 +34,8 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
     val keyboard = KeyboardInput(connection)
     val updater = platform.packages?.let(::AppUpdater)
 
-    val touchpadSpeed: StateFlow<TouchpadSpeed> =
-        storage.touchpadSpeed.stateIn(viewModelScope, SharingStarted.Eagerly, TouchpadSpeed())
+    val touchpadSettings: StateFlow<TouchpadSettings> =
+        storage.touchpadSettings.stateIn(viewModelScope, SharingStarted.Eagerly, TouchpadSettings())
 
     private val _notices = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
@@ -57,8 +57,8 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
         if (link == null) notify("这不是 EchoPad 的配对码") else connection.pair(link)
     }
 
-    fun setTouchpadSpeed(speed: TouchpadSpeed) {
-        viewModelScope.launch { storage.setTouchpadSpeed(speed) }
+    fun setTouchpadSettings(settings: TouchpadSettings) {
+        viewModelScope.launch { storage.setTouchpadSettings(settings) }
     }
 
     /** 打开设置时 [force] 为 false，距上次检查不足 5 分钟就跳过；手动检查为 true。 */

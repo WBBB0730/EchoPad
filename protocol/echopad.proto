@@ -10,7 +10,7 @@ option java_package = "com.wbbb.echopad.mobile.protocol";
 // （新增、删除消息或字段，或者改变了含义）把 CURRENT 加一。
 enum ProtocolVersion {
   PROTOCOL_VERSION_UNSPECIFIED = 0;
-  PROTOCOL_VERSION_CURRENT = 1;
+  PROTOCOL_VERSION_CURRENT = 2;
 }
 
 // 手机端 → 电脑端
@@ -28,6 +28,7 @@ message ClientMessage {
     ShortcutAction shortcut_action = 10;
     Zoom zoom = 11;
     DictationCancel dictation_cancel = 12;
+    CharacterPress character_press = 13;
   }
 }
 
@@ -69,6 +70,8 @@ message ButtonAction {
   }
   MouseButton button = 1;
   Kind kind = 2;
+  // 和这次点击一起按下的修饰键（ADR-0016）。拖拽时在 KIND_PRESS 上，电脑端按到 KIND_RELEASE 为止。
+  repeated ModifierKey modifiers = 3;
 }
 
 // 双指滑动的距离，单位为像素。内容跟随手指移动：手指向下滑，内容向下移动。
@@ -143,6 +146,25 @@ message KeyPress {
     KEY_MUTE = 20;
   }
   Key key = 1;
+  // 和这个键一起按下的修饰键（ADR-0016），媒体键不带。
+  repeated ModifierKey modifiers = 2;
+}
+
+// 修饰键。电脑端按下、执行这条消息、再松开，不会一直按着（ADR-0016）。
+enum ModifierKey {
+  MODIFIER_KEY_UNSPECIFIED = 0;
+  MODIFIER_KEY_CONTROL = 1;
+  // Mac 上的 Option，Windows 上的 Alt。
+  MODIFIER_KEY_ALT = 2;
+  MODIFIER_KEY_SHIFT = 3;
+  // Mac 上的 Command，Windows 上的 Win。
+  MODIFIER_KEY_META = 4;
+}
+
+// 在手机键盘上打的一个字，和修饰键一起作为组合键按下，不上屏。
+message CharacterPress {
+  string character = 1;
+  repeated ModifierKey modifiers = 2;
 }
 
 // 快捷操作：只描述意图，由电脑端按自己的系统换成组合键。
@@ -183,6 +205,14 @@ message Welcome {
   string device_key = 2;
   // 电脑端的固定标识。电脑的地址变了以后，手机端在局域网里按它找到新地址。
   string desktop_id = 3;
+  // 电脑的系统，手机端按它显示修饰键的名称。
+  OperatingSystem operating_system = 4;
+}
+
+enum OperatingSystem {
+  OPERATING_SYSTEM_UNSPECIFIED = 0;
+  OPERATING_SYSTEM_MACOS = 1;
+  OPERATING_SYSTEM_WINDOWS = 2;
 }
 
 message Rejected {

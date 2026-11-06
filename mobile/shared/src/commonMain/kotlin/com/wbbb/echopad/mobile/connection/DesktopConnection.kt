@@ -6,6 +6,7 @@ import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.Hello
+import com.wbbb.echopad.mobile.protocol.OperatingSystem
 import com.wbbb.echopad.mobile.protocol.ProtocolVersion
 import com.wbbb.echopad.mobile.protocol.Rejected
 import com.wbbb.echopad.mobile.protocol.ServerMessage
@@ -46,7 +47,8 @@ sealed interface ConnectionState {
     /** 一台电脑都没配过。 */
     data object Unpaired : ConnectionState
     data object Connecting : ConnectionState
-    data class Connected(val desktopName: String) : ConnectionState
+    /** [operatingSystem] 是当前电脑的系统，按它显示修饰键的名称。 */
+    data class Connected(val desktopName: String, val operatingSystem: OperatingSystem) : ConnectionState
 
     /** 和当前电脑版本不兼容（ADR-0010）：配对仍然有效，继续重连，直到较旧的一端更新。 */
     data class VersionMismatch(val outdated: OutdatedApp) : ConnectionState
@@ -91,8 +93,8 @@ class DesktopConnection(
     /** 当前电脑的电脑端标识。 */
     val activeId: StateFlow<String?> = _activeId.asStateFlow()
 
-    /** 各台电脑端是否在线，以及在线时的名称。没有记录的就是正在连接。 */
-    private val online = MutableStateFlow<Map<String, String>>(emptyMap())
+    /** 各台电脑端是否在线，以及在线时的名称和系统。没有记录的就是正在连接。 */
+    private val online = MutableStateFlow<Map<String, ConnectionState.Connected>>(emptyMap())
 
     /** 和哪些电脑端版本不兼容，以及该更新哪一端；连上后清除。 */
     private val mismatched = MutableStateFlow<Map<String, OutdatedApp>>(emptyMap())
@@ -100,14 +102,14 @@ class DesktopConnection(
     private val outgoing = MutableStateFlow<Map<String, SendChannel<ByteArray>>>(emptyMap())
 
     val desktops: StateFlow<List<DesktopEntry>> = combine(paired, online) { desktops, online ->
-        desktops.map { DesktopEntry(it.id, online[it.id] ?: it.name, it.id in online) }
+        desktops.map { DesktopEntry(it.id, online[it.id]?.desktopName ?: it.name, it.id in online) }
     }.stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     val state: StateFlow<ConnectionState> = combine(loaded, _activeId, online, mismatched) { loaded, activeId, online, mismatched ->
         when {
             !loaded -> ConnectionState.Starting
             activeId == null -> ConnectionState.Unpaired
-            else -> online[activeId]?.let(ConnectionState::Connected)
+            else -> online[activeId]
                 ?: mismatched[activeId]?.let(ConnectionState::VersionMismatch)
                 ?: ConnectionState.Connecting
         }
@@ -353,7 +355,7 @@ class DesktopConnection(
             val desktop = PairedDesktop(id, welcome.desktop_name, host, port, deviceKey, fingerprint)
             onWelcome(desktop)
             commands.send(Command.Welcomed(desktop, paired = target is Target.Pairing))
-            online.update { it + (id to desktop.name) }
+            online.update { it + (id to ConnectionState.Connected(desktop.name, welcome.operating_system)) }
 
             coroutineScope {
                 val queue = Channel<ByteArray>(Channel.UNLIMITED)

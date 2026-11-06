@@ -24,24 +24,26 @@ import com.wbbb.echopad.mobile.protocol.KeyPress
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
-actual fun Modifier.phoneKeyboard(keyboard: KeyboardInput, open: Boolean): Modifier =
-    this then PhoneKeyboardElement(keyboard, open)
+actual fun Modifier.phoneKeyboard(keyboard: KeyboardInput, open: Boolean, plain: Boolean): Modifier =
+    this then PhoneKeyboardElement(keyboard, open, plain)
 
-private data class PhoneKeyboardElement(val keyboard: KeyboardInput, val open: Boolean) :
+private data class PhoneKeyboardElement(val keyboard: KeyboardInput, val open: Boolean, val plain: Boolean) :
     ModifierNodeElement<PhoneKeyboardNode>() {
-    override fun create() = PhoneKeyboardNode(keyboard, open)
+    override fun create() = PhoneKeyboardNode(keyboard, open, plain)
 
-    override fun update(node: PhoneKeyboardNode) = node.update(keyboard, open)
+    override fun update(node: PhoneKeyboardNode) = node.update(keyboard, open, plain)
 }
 
 /**
  * 打开时建立输入法会话，输入法的输出经 [DirectInputConnection] 交给 [KeyboardInput]。
  * 系统只把输入法连到拿到焦点的界面上，所以打开时先申请焦点，拿到焦点后才建立会话；
  * 否则应用冷启动后界面还没有焦点，输入法会连到窗口自带的空连接上，打的字全部丢失。
+ * [plain] 变了就重新建立会话，输入法按新的输入类型换键盘。
  */
 private class PhoneKeyboardNode(
     private var keyboard: KeyboardInput,
     private var open: Boolean,
+    private var plain: Boolean,
 ) : DelegatingNode(), PlatformTextInputModifierNode, CompositionLocalConsumerModifierNode {
     private val focusTarget = delegate(
         FocusTargetModifierNode(onFocusChange = { _, current -> onFocusChanged(current.isFocused) }),
@@ -52,10 +54,11 @@ private class PhoneKeyboardNode(
         if (open) focusTarget.requestFocus()
     }
 
-    fun update(keyboard: KeyboardInput, open: Boolean) {
-        if (keyboard == this.keyboard && open == this.open) return
+    fun update(keyboard: KeyboardInput, open: Boolean, plain: Boolean) {
+        if (keyboard == this.keyboard && open == this.open && plain == this.plain) return
         this.keyboard = keyboard
         this.open = open
+        this.plain = plain
         if (!isAttached) return
         stopSession()
         when {
@@ -80,13 +83,19 @@ private class PhoneKeyboardNode(
     private fun startSession() {
         stopSession()
         val keyboard = keyboard
+        val plain = plain
         session = coroutineScope.launch {
             establishTextInputSession {
                 // 输入法连上这个会话之后再弹出手机键盘。
                 launch { view.inputMethodManager.showSoftInput(view, 0) }
                 startInputMethod(
                     PlatformTextInputMethodRequest { outAttributes ->
-                        outAttributes.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                        outAttributes.inputType = if (plain) {
+                            // 和密码框一样：输入法不组字、不联想，换成英文键盘，每个字直接交出来。
+                            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                        } else {
+                            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                        }
                         // 横屏时输入法默认铺满全屏，会挡住触控区。
                         outAttributes.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI
                         outAttributes.initialSelStart = 0
