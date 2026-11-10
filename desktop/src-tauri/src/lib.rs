@@ -169,6 +169,14 @@ pub fn run() {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("desktop_lib=info")))
         .init();
 
+    // 电脑端常驻在后台，macOS 的 App Nap 会把它降到最低优先级，电脑一忙，手机端的操作就要排队（docs/prd/touchpad.md）。
+    // 声明在处理用户的操作，系统就不让它进入 App Nap，也不妨碍电脑休眠；运行期间一直持有，退出时随进程结束。
+    #[cfg(target_os = "macos")]
+    let _activity = objc2_foundation::NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        objc2_foundation::NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+        objc2_foundation::ns_string!("Applying input from paired phones"),
+    );
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
