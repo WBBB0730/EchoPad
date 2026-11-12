@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 主题图标的单色图层：实心圆点加两圈细环，取自图标的宝石和波纹 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,47a7,7 0,1 1,0 14a7,7 0,1 1,0 -14z" />
+    <path
+        android:pathData="M54,37.5a16.5,16.5 0,1 1,0 33a16.5,16.5 0,1 1,0 -33z"
+        android:strokeWidth="3.3"
+        android:strokeColor="#FFFFFF" />
+    <path
+        android:pathData="M54,28.3a25.7,25.7 0,1 1,0 51.4a25.7,25.7 0,1 1,0 -51.4z"
+        android:strokeWidth="2.3"
+        android:strokeColor="#FFFFFF" />
+</vector>

@@ -51,6 +51,14 @@ cd desktop
 APPLE_SIGNING_IDENTITY="Developer ID Application: …" pnpm tauri build --bundles app
 ```
 
+macOS 26 起使用的应用图标，源文件是 `desktop/src-tauri/icons/AppIcon.icon`（Icon Composer 文档）。Tauri 打包时编译它会失败（[tauri-apps/tauri#16386](https://github.com/tauri-apps/tauri/issues/16386)），所以打包用的是预先编译好的 `icons/Assets.car`。改了图标后需要用 Xcode 26 以上重新生成；如果报 "Bad file descriptor"，先结束 `ibtoold` 进程再试：
+
+```bash
+cd desktop/src-tauri/icons
+out=$(mktemp -d)
+xcrun actool AppIcon.icon --compile "$out" --app-icon AppIcon --include-all-app-icons --platform macosx --target-device mac --minimum-deployment-target 26.0 --output-partial-info-plist "$out/info.plist" < /dev/null && cp "$out/Assets.car" .
+```
+
 ## 手机端
 
 用 Android Studio 打开 `mobile/` 运行，或安装到已连接的设备：

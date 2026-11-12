@@ -19,6 +19,7 @@ use anyhow::Context;
 use serde::Serialize;
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
+    image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -40,6 +41,8 @@ use crate::{
 
 /// 菜单栏图标的标识，手机端在线状态变化时据此更新右键菜单。
 const TRAY_ID: &str = "main";
+/// 菜单栏图标用的单色模板图，由系统按菜单栏的深浅色着色。
+const TRAY_ICON: Image<'_> = tauri::include_image!("icons/tray-template.png");
 /// 右键菜单里"让某部手机控制这台电脑"的菜单项标识前缀，后面接手机端的固定标识。
 const SWITCH_MENU_PREFIX: &str = "switch:";
 
@@ -248,9 +251,9 @@ pub fn run() {
 
 /// 菜单栏图标：左键点击打开窗口；右键点击是菜单，可以重新打开窗口、让在线的手机端切换过来、退出电脑端。
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
-    let icon = app.default_window_icon().cloned().expect("the app icon is bundled");
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icon)
+        .icon(TRAY_ICON)
+        .icon_as_template(true)
         .tooltip("EchoPad")
         .menu(&tray_menu(app.handle(), &[])?)
         .show_menu_on_left_click(false)
