@@ -6,7 +6,7 @@ import { type ChangelogEntry } from "./changelog";
 /** 标签必须是 `v` + 代码里的版本号，版本号只接受 X.Y.Z（ADR-0008）。 */
 export function checkReleaseTag(tag: string | undefined, version: string): void {
   if (tag !== `v${version}`) {
-    throw new Error(`Tag ${tag ?? "(missing)"} does not match version ${version} in desktop/package.json`);
+    throw new Error(`Tag ${tag ?? "(missing)"} does not match version ${version} in package.json`);
   }
   const parsed = parse(version);
   if (parsed === null || parsed.prerelease.length > 0 || parsed.build.length > 0) {

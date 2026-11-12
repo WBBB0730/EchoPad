@@ -7,7 +7,7 @@ import { findChangelogEntry, parseChangelog } from "./changelog";
 import { checkReleaseTag } from "./release";
 
 const tag = process.argv[2];
-const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+const { version } = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
   version: string;
 };
 checkReleaseTag(tag, version);

@@ -9,7 +9,7 @@ const [url, signatureFile, out] = process.argv.slice(2);
 if (url === undefined || signatureFile === undefined || out === undefined) {
   throw new Error("Usage: update-manifest.ts <url> <signature-file> <out>");
 }
-const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+const { version } = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
   version: string;
 };
 

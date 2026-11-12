@@ -1,7 +1,6 @@
 {
   "name": "desktop",
   "private": true,
-  "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,8 +9,7 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "check": "pnpm build && pnpm typecheck:node && pnpm test",
     "preview": "vite preview",
-    "tauri": "tauri",
-    "release": "bumpp"
+    "tauri": "tauri"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
@@ -37,7 +35,6 @@
     "@types/react-dom": "^19.1.6",
     "@types/semver": "^7.8.0",
     "@vitejs/plugin-react": "^6.0.2",
-    "bumpp": "^12.3.0",
     "mdast-util-from-markdown": "^2.1.0",
     "mdast-util-to-string": "^4.0.0",
     "semver": "^7.8.5",

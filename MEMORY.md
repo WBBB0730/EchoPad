@@ -8,4 +8,4 @@ Durable project knowledge not captured elsewhere.
 
 ## Verified Learnings
 
-- **本地打包签名**：电脑端用钥匙串里的 `Developer ID Application: Bangyue Went (Y8NWKVHU3J)` 签名，换了签名就要重新授权辅助功能。安卓 APK 先打 release 包，再用 `~/.android/debug.keystore`（别名 `androiddebugkey`）经 apksigner 签名，输出 `mobile/androidApp/build/outputs/apk/release/EchoPad-<版本号>.apk`。
+- **本地打包签名**：电脑端用钥匙串里的 `Developer ID Application: Bangyue Went (Y8NWKVHU3J)` 签名，换了签名就要重新授权辅助功能。安卓本机只打调试包（`./gradlew :androidApp:installDebug`），包名带 `.debug`，和官方版共存。

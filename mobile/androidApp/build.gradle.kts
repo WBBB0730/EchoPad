@@ -23,8 +23,8 @@ dependencies {
     debugImplementation(libs.compose.uiTooling)
 }
 
-// 两端共用一个版本号，只写在 desktop/package.json（ADR-0008）。
-val appVersion = providers.fileContents(rootProject.layout.projectDirectory.file("../desktop/package.json")).asText
+// 两端共用一个版本号，只写在仓库根的 package.json（ADR-0008）。
+val appVersion = providers.fileContents(rootProject.layout.projectDirectory.file("../package.json")).asText
     .map { (JsonSlurper().parseText(it) as Map<*, *>)["version"] as String }
     .get()
 val (major, minor, patch) = appVersion.split(".").map(String::toInt)
@@ -61,6 +61,10 @@ android {
         }
     }
     buildTypes {
+        // 本机打的 debug 包换一个包名，可以和发版的正式版同时装在一台手机上。
+        debug {
+            applicationIdSuffix = ".debug"
+        }
         release {
             signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = false

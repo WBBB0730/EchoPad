@@ -35,7 +35,7 @@ EchoPad 目前只能在维护者自己的电脑上手动打包：电脑端在本
 ## Implementation Decisions
 
 - **仓库**：公开的 GitHub 仓库，安装包和更新清单都发在它的 Release 上；用户下载和应用检查更新都不需要任何凭证（ADR-0009）。
-- **版本号（ADR-0008）**：两端共用一个 SemVer 版本号，只接受 `X.Y.Z`，不带预发布后缀。版本号只写在 `desktop/package.json` 一处：`tauri.conf.json` 指向它，`Cargo.toml` 不写版本号，手机端构建时从它读取版本名。还没发版时版本号是 `0.0.0`。维护者在 `desktop/` 下运行 `pnpm release`（bumpp），改好版本号后提交、打 `vX.Y.Z` 标签并推送。安卓的 `versionCode` 由版本号算出（`X × 10000 + Y × 100 + Z + 1`，加 1 是因为 `versionCode` 必须是正整数），因此次版本号和补丁号都不能超过 99，超过时手机端构建直接失败。
+- **版本号（ADR-0008）**：两端共用一个 SemVer 版本号，只接受 `X.Y.Z`，不带预发布后缀。版本号只写在仓库根的 `package.json` 一处：`tauri.conf.json` 指向它，`Cargo.toml` 不写版本号，手机端构建时从它读取版本名。还没发版时版本号是 `0.0.0`。维护者在仓库根运行 `npm run release`：先拉取远端，再用 bumpp（经 npx 运行，仓库根不装依赖）改好版本号后提交、打 `vX.Y.Z` 标签并推送；工作区有未提交的改动时拒绝执行，避免漏提交的更新日志没跟上这一版（同 GodotStarter）。安卓的 `versionCode` 由版本号算出（`X × 10000 + Y × 100 + Z + 1`，加 1 是因为 `versionCode` 必须是正整数），因此次版本号和补丁号都不能超过 99，超过时手机端构建直接失败。
 - **触发与门禁**：只有推 `v*` 标签才会发版。检查 job 先确认三件事：标签所在的提交在 `main` 上、标签和各处的版本号一致、版本号不带预发布后缀；然后跑两端的全部检查和测试。检查和打包同时进行，发布 job 要求两者都通过（同 DevCube）。
 - **Mac 打包**：在 macOS runner 上打 arm64 的 `.dmg`（首次安装用）和 `.app.tar.gz`（更新包）。强制 Developer ID 签名并公证，凭证复用 DevCube 那一套（证书、证书密码、App Store Connect API Key），全部来自 GitHub Secrets；缺任何一项就在打包前失败，打包后再校验签名和公证票据。更新包另外用 Tauri 更新签名私钥签名，生成 `.sig`。
 - **安卓打包**：在 Linux runner 上打 release APK，用发版签名文件签名；签名文件和密码来自 GitHub Secrets，缺任何一项就失败。只打一个不分 CPU 架构的通用 APK，不打 AAB。

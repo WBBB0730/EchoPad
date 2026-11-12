@@ -14,7 +14,7 @@
 | `desktop/` | 电脑端：执行手机端发来的操作、模拟键鼠、把声音转发给识别服务 | Tauri 2（Rust）+ React + TypeScript |
 | `mobile/` | 手机端 App，先做 Android，后续可加 iOS | Kotlin Multiplatform + Compose Multiplatform |
 
-应用标识：电脑端 `com.wbbb.echopad.desktop`，手机端 `com.wbbb.echopad.mobile`。
+应用标识：电脑端 `com.wbbb.echopad.desktop`，手机端 `com.wbbb.echopad.mobile`（debug 构建是 `com.wbbb.echopad.mobile.debug`）。
 
 ## 电脑端
 
@@ -68,6 +68,8 @@ cd mobile
 ./gradlew :androidApp:installDebug
 ```
 
+debug 构建的包名带 `.debug` 后缀，桌面上显示为"EchoPad Debug"，可以和发版的正式版同时安装。
+
 测试：
 
 ```bash
@@ -77,12 +79,13 @@ cd mobile
 
 ## 发版
 
-两端共用一个版本号，只写在 `desktop/package.json`（ADR-0008）。先在仓库根的 `CHANGELOG.md` 里写好这一版的更新日志（写法见 `docs/prd/release.md`），再升版本号、提交、打 `vX.Y.Z` 标签并推送：
+两端共用一个版本号，只写在仓库根的 `package.json`（ADR-0008）。先在仓库根的 `CHANGELOG.md` 里写好这一版的更新日志（写法见 `docs/prd/release.md`）并提交，再在仓库根运行：
 
 ```bash
-cd desktop
-pnpm release
+npm run release
 ```
+
+它先拉取远端（本地与远端分叉时停下），再用 bumpp 交互选择新版本，改好版本号后提交、打 `vX.Y.Z` 标签并推送。bumpp 通过 npx 运行，不用安装依赖。工作区有未提交的改动时拒绝执行，避免漏提交的更新日志没跟上这一版。
 
 GitHub Actions 看到标签后检查两端、打包，全部成功后发到 GitHub Release，两端的应用内更新随之生效（`docs/prd/in-app-update.md`）。发版需要在仓库的 GitHub Secrets 里配好以下内容，Apple 那几项与 DevCube 的同名 Secret 相同：
 
