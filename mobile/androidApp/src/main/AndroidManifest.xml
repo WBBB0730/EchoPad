@@ -8,6 +8,14 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- 应用内更新：把下载好的新版本交给系统安装（ADR-0009）。 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 配过电脑时用前台服务在后台一直保持连接，带一条常驻通知（ADR-0019）。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- connectedDevice 类型的前台服务要求声明的权限之一；EchoPad 并不改变网络状态。 -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 手机开机后自动恢复后台连接。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <uses-feature
         android:name="android.hardware.camera"
@@ -42,6 +50,66 @@
                 <data
                     android:host="pair"
                     android:scheme="echopad" />
+            </intent-filter>
+        </activity>
+
+        <!-- 后台连接（ADR-0019）。 -->
+        <service
+            android:name=".connection.ConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+        <!-- 开机、更新以后启动前台服务。 -->
+        <receiver
+            android:name=".connection.ConnectionStarter"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <!-- 剪贴板同步（docs/prd/clipboard-sync.md、ADR-0017）。 -->
+        <service
+            android:name=".clipboard.SyncClipboardTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_content_paste"
+            android:label="@string/sync_clipboard"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <!-- 通知按钮和磁贴用的透明页面，不对其他应用开放。 -->
+        <activity
+            android:name=".clipboard.SyncClipboardActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.EchoPad.Transparent" />
+        <!-- 文字选择菜单和分享菜单里的"同步到 EchoPad"。 -->
+        <activity
+            android:name=".clipboard.SyncTextActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:label="@string/sync_to_echopad"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.EchoPad.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
     </application>

@@ -5,6 +5,7 @@ import com.wbbb.echopad.mobile.pairing.PairedDesktop
 import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.protocol.ClientMessage
+import com.wbbb.echopad.mobile.protocol.ClipboardText
 import com.wbbb.echopad.mobile.protocol.Hello
 import com.wbbb.echopad.mobile.protocol.OperatingSystem
 import com.wbbb.echopad.mobile.protocol.ProtocolVersion
@@ -60,6 +61,9 @@ enum class OutdatedApp { Mobile, Desktop }
 /** 配过的一台电脑端，以及它是否在线。 */
 data class DesktopEntry(val id: String, val name: String, val online: Boolean)
 
+/** 电脑端 [desktopId] 发来的剪贴板。 */
+data class DesktopClipboard(val desktopId: String, val clipboard: ClipboardText)
+
 sealed interface ConnectionNotice {
     /** 扫到的配对码已经用过或已失效。 */
     data object PairingCodeRejected : ConnectionNotice
@@ -74,10 +78,13 @@ sealed interface ConnectionNotice {
 /**
  * 与配过的所有电脑端保持连接（docs/prd/pairing.md、ADR-0004、ADR-0015）：每台各自重连，
  * 其中一台是当前电脑，操作只发给它，界面上的连接状态和收到的消息也只看它。
- * 换网时不干等：还没连上时手机的网络一变就立即重来；断线期间用 [finder] 在局域网里查找电脑端，
+ * 换网时不干等：还没连上时手机的网络一变、屏幕一亮就立即重来；断线期间用 [finder] 在局域网里查找电脑端，
  * 它换了地址就立即改连新地址。连着的时候不查找，靠心跳发现断线（ADR-0004）。
  *
  * 配对、取消配对、切换以及各条连接报告的结果，都排队按顺序处理，状态不会被并发改乱。
+ *
+ * 剪贴板同步不只是当前电脑（docs/prd/clipboard-sync.md）：每条连接在验证配对后先发出 [greeting] 给出的消息，
+ * 任何一台电脑端发来的剪贴板都交给 [clipboardTexts]。
  */
 class DesktopConnection(
     private val store: PairedDesktopStore,
@@ -85,7 +92,10 @@ class DesktopConnection(
     private val transport: Transport,
     private val scope: CoroutineScope,
     private val finder: DesktopFinder,
-    private val networkChanges: SharedFlow<Unit>,
+    /** 手机的网络变了、屏幕亮了时发出：还没连上的电脑立即重连（ADR-0004）。 */
+    private val wakeUps: Flow<Unit>,
+    /** 每条连接验证配对后先发出的消息，在连接建立的那一刻取。 */
+    private val greeting: () -> List<ClientMessage>,
 ) {
     private val paired = MutableStateFlow<List<PairedDesktop>>(emptyList())
     private val _activeId = MutableStateFlow<String?>(null)
@@ -115,6 +125,15 @@ class DesktopConnection(
         }
     }.stateIn(scope, SharingStarted.Eagerly, ConnectionState.Starting)
 
+    /** 是否配过电脑，配过就要在后台一直保持连接（ADR-0019）；还没读出已保存的配对时为 null。 */
+    val hasDesktops: StateFlow<Boolean?> = state.map { state ->
+        when (state) {
+            ConnectionState.Starting -> null
+            ConnectionState.Unpaired -> false
+            else -> true
+        }
+    }.stateIn(scope, SharingStarted.Eagerly, null)
+
     private val _messages = MutableSharedFlow<ServerMessage>(extraBufferCapacity = 64)
 
     /** 当前电脑发来的消息。 */
@@ -122,6 +141,11 @@ class DesktopConnection(
 
     private val _notices = MutableSharedFlow<ConnectionNotice>(extraBufferCapacity = 8)
     val notices: SharedFlow<ConnectionNotice> = _notices.asSharedFlow()
+
+    private val _clipboardTexts = MutableSharedFlow<DesktopClipboard>(extraBufferCapacity = 16)
+
+    /** 任何一台电脑端发来的剪贴板，不只是当前电脑。 */
+    val clipboardTexts: SharedFlow<DesktopClipboard> = _clipboardTexts.asSharedFlow()
 
     /** 读取已保存的配对之后才开始处理，扫码冷启动 App 时，新的配对不会被旧状态覆盖。 */
     private val commands = Channel<Command>(Channel.UNLIMITED)
@@ -162,6 +186,12 @@ class DesktopConnection(
     fun send(message: ClientMessage): Boolean {
         val id = _activeId.value ?: return false
         return outgoing.value[id]?.trySend(message.encode())?.isSuccess == true
+    }
+
+    /** 发给除 [except] 以外所有在线的电脑端，返回发到了哪几台（电脑端标识）。 */
+    fun sendToAll(message: ClientMessage, except: String? = null): List<String> {
+        val bytes = message.encode()
+        return outgoing.value.filter { (id, queue) -> id != except && queue.trySend(bytes).isSuccess }.keys.toList()
     }
 
     private suspend fun handle(command: Command) {
@@ -250,7 +280,7 @@ class DesktopConnection(
         try {
             while (true) {
                 val wake = nextAttempt(wait, target, advertised)
-                if (wake == Wake.NetworkChanged) failures = 0
+                if (wake == Wake.WokeUp) failures = 0
                 target = target.locatedAt(advertised.value)
                 log.i { "$id connecting to ${target.address}" + (wake?.let { " ($it)" } ?: "") }
                 var welcomed = false
@@ -275,7 +305,7 @@ class DesktopConnection(
                         mismatched.update { it + (id to end.outdated) }
                         reconnectDelay(failures++)
                     }
-                    SessionEnd.NetworkChanged -> {
+                    SessionEnd.WokeUp -> {
                         failures = 0
                         Duration.ZERO
                     }
@@ -293,13 +323,13 @@ class DesktopConnection(
         }
     }
 
-    /** 等到下次重连：间隔到了就连；手机的网络变了、或者电脑换了地址，不再等。 */
+    /** 等到下次重连：间隔到了就连；手机的网络变了、屏幕亮了、或者电脑换了地址，不再等。 */
     private suspend fun nextAttempt(interval: Duration, target: Target, advertised: StateFlow<Set<DesktopAddress>>): Wake? =
         withTimeoutOrNull(interval) {
-            merge(networkChanges.map { Wake.NetworkChanged }, moved(target, advertised).map { Wake.Moved }).first()
+            merge(wakeUps.map { Wake.WokeUp }, moved(target, advertised).map { Wake.Moved }).first()
         }
 
-    /** 连接并一直用到断开。还没连上时手机的网络变了、或者电脑换了地址，这次连接作废，好立即重来。 */
+    /** 连接并一直用到断开。还没连上时手机的网络变了、屏幕亮了、或者电脑换了地址，这次连接作废，好立即重来。 */
     private suspend fun attempt(
         id: String,
         target: Target,
@@ -308,7 +338,7 @@ class DesktopConnection(
     ): SessionEnd = try {
         merge(
             flow { emit(session(id, target, onWelcome)) },
-            networkChanges.filter { id !in online.value }.map { SessionEnd.NetworkChanged },
+            wakeUps.filter { id !in online.value }.map { SessionEnd.WokeUp },
             moved(target, advertised).filter { id !in online.value }.map { SessionEnd.Moved },
         ).first()
     } catch (e: CancellationException) {
@@ -355,11 +385,13 @@ class DesktopConnection(
             val desktop = PairedDesktop(id, welcome.desktop_name, host, port, deviceKey, fingerprint)
             onWelcome(desktop)
             commands.send(Command.Welcomed(desktop, paired = target is Target.Pairing))
-            online.update { it + (id to ConnectionState.Connected(desktop.name, welcome.operating_system)) }
 
             coroutineScope {
                 val queue = Channel<ByteArray>(Channel.UNLIMITED)
+                greeting().forEach { queue.trySend(it.encode()) }
+                // 先能发消息、再算在线：看到在线就能发出去。
                 outgoing.update { it + (id to queue) }
+                online.update { it + (id to ConnectionState.Connected(desktop.name, welcome.operating_system)) }
                 try {
                     launch {
                         for (bytes in queue) session.send(bytes)
@@ -379,6 +411,7 @@ class DesktopConnection(
             val message = ServerMessage.ADAPTER.decode(session.receive())
             when {
                 message.switch_request != null -> commands.send(Command.Switch(id, byDesktop = true))
+                message.clipboard_text != null -> _clipboardTexts.emit(DesktopClipboard(id, message.clipboard_text))
                 _activeId.value == id -> _messages.emit(message)
             }
         }
@@ -417,7 +450,7 @@ class DesktopConnection(
         }
     }
 
-    private enum class Wake { NetworkChanged, Moved }
+    private enum class Wake { WokeUp, Moved }
 
     private sealed interface Command {
         class Pair(val link: PairingLink) : Command
@@ -433,8 +466,8 @@ class DesktopConnection(
         data object Dropped : SessionEnd
         data object Rejected : SessionEnd
 
-        /** 还没连上时手机的网络变了。 */
-        data object NetworkChanged : SessionEnd
+        /** 还没连上时手机的网络变了、或者屏幕亮了。 */
+        data object WokeUp : SessionEnd
 
         /** 还没连上时电脑换了地址。 */
         data object Moved : SessionEnd

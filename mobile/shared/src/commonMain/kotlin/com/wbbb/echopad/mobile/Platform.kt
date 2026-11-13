@@ -1,5 +1,6 @@
 package com.wbbb.echopad.mobile
 
+import com.wbbb.echopad.mobile.clipboard.PhoneClipboard
 import com.wbbb.echopad.mobile.connection.DesktopFinder
 import com.wbbb.echopad.mobile.update.AppPackages
 import kotlinx.coroutines.flow.SharedFlow
@@ -11,6 +12,10 @@ class Platform(
     val desktopFinder: DesktopFinder,
     /** 手机的网络变了时发出。 */
     val networkChanges: SharedFlow<Unit>,
+    /** 手机的屏幕亮了时发出。 */
+    val screenTurnedOn: SharedFlow<Unit>,
     /** 应用内更新；iOS 版还没有，为 null。 */
     val packages: AppPackages? = null,
+    /** 剪贴板同步用的系统剪贴板；iOS 版还没有，为 null。 */
+    val clipboard: PhoneClipboard? = null,
 )

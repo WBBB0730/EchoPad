@@ -10,7 +10,7 @@ option java_package = "com.wbbb.echopad.mobile.protocol";
 // （新增、删除消息或字段，或者改变了含义）把 CURRENT 加一。
 enum ProtocolVersion {
   PROTOCOL_VERSION_UNSPECIFIED = 0;
-  PROTOCOL_VERSION_CURRENT = 2;
+  PROTOCOL_VERSION_CURRENT = 3;
 }
 
 // 手机端 → 电脑端
@@ -29,6 +29,8 @@ message ClientMessage {
     Zoom zoom = 11;
     DictationCancel dictation_cancel = 12;
     CharacterPress character_press = 13;
+    ClipboardSyncSetting clipboard_sync_setting = 14;
+    ClipboardText clipboard_text = 15;
   }
 }
 
@@ -182,6 +184,21 @@ message ShortcutAction {
   Shortcut shortcut = 1;
 }
 
+// 手机端是否开着剪贴板同步（docs/prd/clipboard-sync.md）。开着时在验证配对后的第一条消息里发送，
+// 之后开关变化时再发；电脑端只把剪贴板发给开着同步的手机端，没收到过时当作关着。
+message ClipboardSyncSetting {
+  bool enabled = 1;
+}
+
+// 剪贴板上的文字和它最后更新的时间，两个方向通用（ADR-0018）。有人复制时推送，连上时不互报。
+// 收到的设备只在它比自己的新时才用（先比更新时间，相同再比文字），用了就转给自己连着的其他设备。
+// 文字按 UTF-8 计不超过 1 MB，更长的不同步。
+message ClipboardText {
+  string text = 1;
+  // Unix 毫秒。
+  int64 updated_at = 2;
+}
+
 // 电脑端 → 手机端
 message ServerMessage {
   oneof body {
@@ -190,6 +207,7 @@ message ServerMessage {
     DictationFinished dictation_finished = 5;
     DictationFailed dictation_failed = 6;
     SwitchRequest switch_request = 8;
+    ClipboardText clipboard_text = 9;
   }
   // 曾用于在手机端显示识别中的文字和逐句上屏的文字，已去掉（ADR-0013）。
   reserved 3, 4;

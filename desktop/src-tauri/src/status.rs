@@ -1,4 +1,5 @@
-//! 电脑端界面显示的状态：配对码、配过的手机端及是否在线、版本是否兼容、权限与语音输入是否可用。
+//! 电脑端界面显示的状态：配对码、配过的手机端及是否在线、版本是否兼容、权限、语音输入是否可用，
+//! 以及系统是否允许读取剪贴板。
 
 use std::sync::Mutex;
 
@@ -16,6 +17,8 @@ pub struct Status {
     /// 尚未检查时为 `None`。
     pub input_permission: Option<bool>,
     pub dictation_ready: bool,
+    /// 开着剪贴板同步，而系统一律拒绝 EchoPad 读取剪贴板（ADR-0017）。
+    pub clipboard_access_denied: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -50,6 +53,7 @@ impl StatusHub {
                 outdated: None,
                 input_permission: None,
                 dictation_ready: false,
+                clipboard_access_denied: false,
             }),
             notify: Box::new(notify),
         }
@@ -81,6 +85,10 @@ impl StatusHub {
 
     pub fn set_dictation_ready(&self, ready: bool) {
         self.update(|status| status.dictation_ready = ready);
+    }
+
+    pub fn set_clipboard_access_denied(&self, denied: bool) {
+        self.update(|status| status.clipboard_access_denied = denied);
     }
 
     fn update(&self, change: impl FnOnce(&mut Status)) {

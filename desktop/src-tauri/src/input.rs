@@ -13,7 +13,7 @@ use enigo::{Axis, Button, Coordinate, Direction, Enigo, InputError, Key, Keyboar
 /// 每隔这么久检查一次辅助功能权限：用户授权后无需重启电脑端；使用中被关掉时界面也会更新。
 const PERMISSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {
     Left,
     Right,

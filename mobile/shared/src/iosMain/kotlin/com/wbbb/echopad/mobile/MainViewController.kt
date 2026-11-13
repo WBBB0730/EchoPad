@@ -10,18 +10,22 @@ import platform.Foundation.NSFileManager
 import platform.Foundation.NSUserDomainMask
 import platform.UIKit.UIDevice
 
-/** 本机存储在一个进程里只能创建一次。 */
-private val platform: Platform by lazy {
-    Platform(
-        deviceName = UIDevice.currentDevice.name,
-        storage = LocalStorage.create("${documentsDirectory()}/echopad.preferences_pb"),
-        // 第一版只发布 Android（docs/prd/pairing.md），iOS 的局域网查找和网络变化之后用 Network 框架实现。
-        desktopFinder = DesktopFinder { emptyFlow() },
-        networkChanges = MutableSharedFlow(),
+/** 本机存储和连接在一个进程里只能创建一次。 */
+private val core: EchoPadCore by lazy {
+    EchoPadCore(
+        Platform(
+            deviceName = UIDevice.currentDevice.name,
+            storage = LocalStorage.create("${documentsDirectory()}/echopad.preferences_pb"),
+            // 第一版只发布 Android（docs/prd/pairing.md），iOS 的局域网查找和网络变化之后用 Network 框架实现。
+            desktopFinder = DesktopFinder { emptyFlow() },
+            networkChanges = MutableSharedFlow(),
+            screenTurnedOn = MutableSharedFlow(),
+            // iOS 的剪贴板同步不做（docs/prd/clipboard-sync.md），设置里不显示这一项。
+        ),
     )
 }
 
-fun MainViewController() = ComposeUIViewController { App(platform) }
+fun MainViewController() = ComposeUIViewController { App(core) }
 
 @OptIn(ExperimentalForeignApi::class)
 private fun documentsDirectory(): String {

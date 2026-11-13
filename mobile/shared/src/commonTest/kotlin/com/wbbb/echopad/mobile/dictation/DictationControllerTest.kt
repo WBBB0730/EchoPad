@@ -33,7 +33,7 @@ class DictationControllerTest {
     /** 已连接的说话按钮，电脑端这一侧，以及手机端提示过的消息。 */
     private suspend fun TestScope.connectedDictation(): Triple<DictationController, FakeSession, List<String>> {
         val store = MemoryStore(pairedDesktop())
-        val connection = DesktopConnection(store, "Phone", transport, backgroundScope, FakeFinder(), MutableSharedFlow())
+        val connection = DesktopConnection(store, "Phone", transport, backgroundScope, FakeFinder(), MutableSharedFlow(), greeting = { emptyList() })
         val session = transport.sessions.receive()
         session.hello()
         session.reply(ServerMessage(welcome = Welcome(desktop_name = "Mac")))

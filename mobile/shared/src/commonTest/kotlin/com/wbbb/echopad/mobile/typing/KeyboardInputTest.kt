@@ -30,7 +30,7 @@ class KeyboardInputTest {
     /** 已连接的手机键盘，以及电脑端这一侧。 */
     private suspend fun TestScope.connectedKeyboard(): Pair<KeyboardInput, FakeSession> {
         val store = MemoryStore(pairedDesktop())
-        val connection = DesktopConnection(store, "Phone", transport, backgroundScope, FakeFinder(), MutableSharedFlow())
+        val connection = DesktopConnection(store, "Phone", transport, backgroundScope, FakeFinder(), MutableSharedFlow(), greeting = { emptyList() })
         val session = transport.sessions.receive()
         session.hello()
         session.reply(ServerMessage(welcome = Welcome(desktop_name = "Mac")))

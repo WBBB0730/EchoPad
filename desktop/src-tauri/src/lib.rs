@@ -1,4 +1,5 @@
 mod certificate;
+mod clipboard;
 mod dictation;
 mod discovery;
 mod input;
@@ -16,7 +17,7 @@ use std::{
 };
 
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
     image::Image,
@@ -30,6 +31,7 @@ use tokio_rustls::rustls::ServerConfig;
 
 use crate::{
     certificate::DesktopCertificate,
+    clipboard::SystemClipboard,
     dictation::{CloudDictation, DictationService},
     input::InputController,
     pairing::PairingStore,
@@ -52,14 +54,14 @@ struct AppState {
 }
 
 impl AppState {
-    /// 按当前设置重建语音输入服务。
+    /// 按当前设置重建语音输入服务，并打开或关闭剪贴板同步。
     fn apply_settings(&self) {
-        let service = self
-            .settings
-            .get()
+        let settings = self.settings.get();
+        let service = settings
             .dictation_config()
             .map(|config| Arc::new(CloudDictation::new(config)) as Arc<dyn DictationService>);
         self.server.set_dictation(service);
+        self.server.set_clipboard_enabled(settings.clipboard.enabled);
     }
 
     fn save_settings(&self, settings: Settings) -> Result<SettingsView, String> {
@@ -140,12 +142,28 @@ fn unpair_phone(state: tauri::State<'_, AppState>, id: String) -> Result<(), Str
     state.server.unpair(&id).map_err(|err| format!("{err:#}"))
 }
 
-/// macOS「系统设置 › 隐私与安全性 › 辅助功能」页面。
-const ACCESSIBILITY_SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+/// macOS「系统设置 › 隐私与安全性」里要用户授权的页面。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PrivacyPane {
+    /// 辅助功能：模拟键鼠需要。
+    Accessibility,
+    /// 粘贴：系统一律拒绝读剪贴板时，剪贴板同步需要（ADR-0017）。
+    Pasteboard,
+}
+
+impl PrivacyPane {
+    fn url(self) -> &'static str {
+        match self {
+            Self::Accessibility => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            Self::Pasteboard => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Pasteboard",
+        }
+    }
+}
 
 #[tauri::command]
-fn open_accessibility_settings(app: AppHandle) -> Result<(), String> {
-    app.opener().open_url(ACCESSIBILITY_SETTINGS_URL, None::<&str>).map_err(|err| err.to_string())
+fn open_privacy_settings(app: AppHandle, pane: PrivacyPane) -> Result<(), String> {
+    app.opener().open_url(pane.url(), None::<&str>).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -235,7 +253,7 @@ pub fn run() {
             get_settings,
             save_settings,
             unpair_phone,
-            open_accessibility_settings,
+            open_privacy_settings,
             get_update_status,
             check_for_updates,
             apply_update
@@ -363,11 +381,23 @@ fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerCo
         },
     );
 
-    let server = ServerContext::new(desktop_name(), host, certificate.fingerprint(), pairing, status, Arc::new(input));
-    let state = AppState {
-        server: Arc::new(server),
-        settings,
-    };
+    let clipboard = Arc::new(SystemClipboard::new());
+    let server = Arc::new(ServerContext::new(
+        desktop_name(),
+        host,
+        certificate.fingerprint(),
+        pairing,
+        status.clone(),
+        Arc::new(input),
+        clipboard.clone(),
+    ));
+    let (enabled, copied) = (server.clone(), server.clone());
+    clipboard.watch(
+        move || enabled.clipboard_enabled(),
+        move |text| copied.share_clipboard(text),
+        move |denied| status.set_clipboard_access_denied(denied),
+    );
+    let state = AppState { server, settings };
     Ok((state, certificate.server_config()?))
 }
 
@@ -376,12 +406,21 @@ mod tests {
     use std::{collections::BTreeMap, net::IpAddr};
 
     use super::*;
-    use crate::input::{InputCommand, InputSink};
+    use crate::{
+        clipboard::ClipboardSink,
+        input::{InputCommand, InputSink},
+    };
 
     struct IgnoredInput;
 
     impl InputSink for IgnoredInput {
         fn send(&self, _command: InputCommand) {}
+    }
+
+    struct IgnoredClipboard;
+
+    impl ClipboardSink for IgnoredClipboard {
+        fn write(&self, _text: &str) {}
     }
 
     fn state() -> AppState {
@@ -397,6 +436,7 @@ mod tests {
                 pairing,
                 status,
                 Arc::new(IgnoredInput),
+                Arc::new(IgnoredClipboard),
             )),
             settings: SettingsStore::load(dir.join("settings.json")).unwrap(),
         }
@@ -419,5 +459,17 @@ mod tests {
         settings.keys.clear();
         state.save_settings(settings).unwrap();
         assert!(!state.server.status.snapshot().dictation_ready);
+    }
+
+    #[test]
+    fn saving_settings_turns_clipboard_sync_on_and_off() {
+        let state = state();
+        state.apply_settings();
+        assert!(state.server.clipboard_enabled());
+
+        let mut settings = Settings::default();
+        settings.clipboard.enabled = false;
+        state.save_settings(settings).unwrap();
+        assert!(!state.server.clipboard_enabled());
     }
 }

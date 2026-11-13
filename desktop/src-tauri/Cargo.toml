@@ -51,6 +51,8 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1"] }
 tower-service = "0.3"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto"] }
 tokio-rustls = "0.26"
+# TCP 保活（ADR-0019）；设置探测次数要用 all 特性。
+socket2 = { version = "0.6.5", features = ["all"] }
 hyper = { version = "1", features = ["server", "http1"] }
 
 
@@ -63,6 +65,7 @@ panic = "abort"
 strip = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"
 objc2-application-services = "0.3.2"
 objc2-core-foundation = "0.3.2"

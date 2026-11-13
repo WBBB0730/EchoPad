@@ -16,6 +16,7 @@ type Settings = {
   recognition: { service: string; doubaoResource: string };
   cleanup: { enabled: boolean; preset: string; baseUrl: string; model: string };
   keys: Partial<Record<Credential, string>>;
+  clipboard: { enabled: boolean };
 };
 
 type Choice = { id: string; name: string; credential: Credential | null };
@@ -187,6 +188,19 @@ export function SettingsPage({
               {keyField(preset?.credential ?? null)}
             </CardContent>
           )}
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>剪贴板同步</CardTitle>
+            <CardAction>
+              <Switch
+                checked={settings.clipboard.enabled}
+                onCheckedChange={(enabled) => update((draft) => (draft.clipboard.enabled = enabled))}
+                aria-label="剪贴板同步"
+              />
+            </CardAction>
+          </CardHeader>
         </Card>
 
         <AboutCard status={updateStatus} onUpdate={onUpdate} />

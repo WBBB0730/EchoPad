@@ -28,11 +28,12 @@ import kotlinx.coroutines.flow.emptyFlow
 
 /** [pairingLinks] 是从系统打开的 `echopad://pair` 链接，例如用系统相机扫码。 */
 @Composable
-fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
-    val viewModel = viewModel { EchoPadViewModel(platform) }
+fun App(core: EchoPadCore, pairingLinks: Flow<String> = emptyFlow()) {
+    val viewModel = viewModel { EchoPadViewModel(core) }
     val state by viewModel.connection.state.collectAsStateWithLifecycle()
     val touchpadSettings by viewModel.touchpadSettings.collectAsStateWithLifecycle()
     val update = viewModel.updater?.state?.collectAsStateWithLifecycle()?.value
+    val clipboardSync = viewModel.clipboardSync?.enabled?.collectAsStateWithLifecycle()?.value
     val snackbar = remember { SnackbarHostState() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
@@ -63,6 +64,8 @@ fun App(platform: Platform, pairingLinks: Flow<String> = emptyFlow()) {
                         keyboard = viewModel.keyboard,
                         settings = touchpadSettings,
                         onSettingsChange = viewModel::setTouchpadSettings,
+                        clipboardSync = clipboardSync,
+                        onClipboardSyncChange = viewModel::setClipboardSync,
                         onScanned = viewModel::onPairingLink,
                         onNotice = viewModel::notify,
                         update = update,

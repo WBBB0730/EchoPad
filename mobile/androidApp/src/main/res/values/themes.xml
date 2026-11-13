@@ -1,0 +1,8 @@
+<resources>
+    <!-- 同步剪贴板的透明页面：浮在原来的应用上方，看不见，只为拿到焦点读剪贴板（ADR-0017）。 -->
+    <style name="Theme.EchoPad.Transparent" parent="@android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+</resources>

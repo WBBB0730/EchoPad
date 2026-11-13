@@ -3,8 +3,6 @@ package com.wbbb.echopad.mobile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.wbbb.echopad.mobile.connection.ConnectionNotice
-import com.wbbb.echopad.mobile.connection.DesktopConnection
-import com.wbbb.echopad.mobile.connection.KtorTransport
 import com.wbbb.echopad.mobile.dictation.DictationController
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.touchpad.TouchpadSettings
@@ -19,20 +17,14 @@ import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
-class EchoPadViewModel(platform: Platform) : ViewModel() {
-    private val storage = platform.storage
-    private val transport = KtorTransport()
-    val connection = DesktopConnection(
-        storage.pairedDesktops,
-        platform.deviceName,
-        transport,
-        viewModelScope,
-        platform.desktopFinder,
-        platform.networkChanges,
-    )
+/** 界面用到的状态和操作。连接和剪贴板同步跟随整个进程，在 [EchoPadCore] 里，界面关掉以后也还在。 */
+class EchoPadViewModel(core: EchoPadCore) : ViewModel() {
+    private val storage = core.storage
+    val connection = core.connection
+    val clipboardSync = core.clipboardSync
     val dictation = DictationController(connection, viewModelScope)
     val keyboard = KeyboardInput(connection)
-    val updater = platform.packages?.let(::AppUpdater)
+    val updater = core.platform.packages?.let(::AppUpdater)
 
     val touchpadSettings: StateFlow<TouchpadSettings> =
         storage.touchpadSettings.stateIn(viewModelScope, SharingStarted.Eagerly, TouchpadSettings())
@@ -59,6 +51,10 @@ class EchoPadViewModel(platform: Platform) : ViewModel() {
 
     fun setTouchpadSettings(settings: TouchpadSettings) {
         viewModelScope.launch { storage.setTouchpadSettings(settings) }
+    }
+
+    fun setClipboardSync(enabled: Boolean) {
+        viewModelScope.launch { storage.setClipboardSync(enabled) }
     }
 
     /** 打开设置时 [force] 为 false，距上次检查不足 5 分钟就跳过；手动检查为 true。 */

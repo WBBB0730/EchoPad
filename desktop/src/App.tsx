@@ -18,6 +18,8 @@ type Status = {
   outdated: "mobile" | "desktop" | null;
   inputPermission: boolean | null;
   dictationReady: boolean;
+  /** 开着剪贴板同步，而系统一律拒绝读取剪贴板（ADR-0017）。 */
+  clipboardAccessDenied: boolean;
 };
 
 function connectionLabel(online: number, outdated: Status["outdated"]): string {
@@ -118,7 +120,7 @@ function App() {
             ok={status.inputPermission === true}
             action={
               status.inputPermission === false && (
-                <Button variant="outline" size="xs" onClick={() => invoke("open_accessibility_settings")}>
+                <Button variant="outline" size="xs" onClick={() => invoke("open_privacy_settings", { pane: "accessibility" })}>
                   打开系统设置
                 </Button>
               )
@@ -127,6 +129,18 @@ function App() {
             {status.inputPermission === false ? "需要允许辅助功能" : "可以控制指针"}
           </StatusRow>
           <StatusRow ok={status.dictationReady}>{status.dictationReady ? "语音输入可用" : "语音输入未配置"}</StatusRow>
+          {status.clipboardAccessDenied && (
+            <StatusRow
+              ok={false}
+              action={
+                <Button variant="outline" size="xs" onClick={() => invoke("open_privacy_settings", { pane: "pasteboard" })}>
+                  打开系统设置
+                </Button>
+              }
+            >
+              需要允许读取剪贴板
+            </StatusRow>
+          )}
           {update.prompt && (
             <StatusRow
               ok

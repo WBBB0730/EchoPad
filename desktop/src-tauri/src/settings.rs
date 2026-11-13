@@ -1,4 +1,4 @@
-//! 语音输入的服务设置（ADR-0007、docs/prd/dictation.md）。
+//! 电脑端的设置：语音输入的服务（ADR-0007、docs/prd/dictation.md）和剪贴板同步（docs/prd/clipboard-sync.md）。
 //! 服务选择和密钥一起保存在本机的设置文件里，由用户自己管理；文件只有当前用户可以读写。
 
 use std::{collections::BTreeMap, fs, io, path::PathBuf, sync::Mutex};
@@ -15,6 +15,9 @@ pub struct Settings {
     /// 用户填写的密钥。同一家服务商只存一份。
     #[serde(default)]
     pub keys: BTreeMap<Credential, String>,
+    /// 以前的设置文件里没有这一项，读出来是默认的开着。
+    #[serde(default)]
+    pub clipboard: ClipboardSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +37,19 @@ pub struct CleanupSettings {
     /// 只有自定义预设使用，其他预设的地址是固定的。
     pub base_url: String,
     pub model: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardSettings {
+    pub enabled: bool,
+}
+
+/// 剪贴板同步默认开着。
+impl Default for ClipboardSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// 已经去掉的预设（例如本机 Ollama）读出来时换成默认预设，旧的设置文件照样能读。
@@ -56,6 +72,7 @@ impl Default for Settings {
                 model: CleanupPreset::default().default_model().to_owned(),
             },
             keys: BTreeMap::new(),
+            clipboard: ClipboardSettings::default(),
         }
     }
 }
@@ -486,5 +503,24 @@ mod tests {
         // 自定义地址的模型由用户填写，保持不变。
         let cleanup = load(json!({ "enabled": true, "preset": "custom", "baseUrl": "https://llm.example.com/v1", "model": "my-model" }));
         assert_eq!(cleanup.model, "my-model");
+    }
+
+    #[test]
+    fn clipboard_sync_is_on_unless_turned_off() {
+        let path = temp_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 以前的设置文件里没有剪贴板同步。
+        let file = json!({
+            "recognition": { "service": "doubao", "doubaoResource": "seed2Duration" },
+            "cleanup": { "enabled": true, "preset": "ark", "baseUrl": "", "model": "doubao-seed-2-0-mini-260428" },
+        });
+        fs::write(&path, file.to_string()).unwrap();
+        let store = SettingsStore::load(path.clone()).unwrap();
+        assert!(store.get().clipboard.enabled);
+
+        let mut settings = store.get();
+        settings.clipboard.enabled = false;
+        store.save(settings).unwrap();
+        assert!(!SettingsStore::load(path).unwrap().get().clipboard.enabled);
     }
 }

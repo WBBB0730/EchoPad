@@ -39,6 +39,8 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -88,6 +90,7 @@ import com.wbbb.echopad.mobile.typing.SwitchableKeys
 import com.wbbb.echopad.mobile.typing.modifiersToggleIcon
 import com.wbbb.echopad.mobile.typing.phoneKeyboard
 import com.wbbb.echopad.mobile.ui.EchoPadColors
+import com.wbbb.echopad.mobile.ui.SettingRow
 import com.wbbb.echopad.mobile.update.AboutRow
 import com.wbbb.echopad.mobile.update.UpdateSheet
 import com.wbbb.echopad.mobile.update.UpdateState
@@ -114,6 +117,9 @@ fun TouchpadScreen(
     keyboard: KeyboardInput,
     settings: TouchpadSettings,
     onSettingsChange: (TouchpadSettings) -> Unit,
+    /** 剪贴板同步是否开着；平台不支持时为 null。 */
+    clipboardSync: Boolean?,
+    onClipboardSyncChange: (Boolean) -> Unit,
     onScanned: (String) -> Unit,
     onNotice: (String) -> Unit,
     /** 应用内更新的状态；平台不支持时为 null。 */
@@ -283,6 +289,8 @@ fun TouchpadScreen(
         SettingsSheet(
             settings = settings,
             onSettingsChange = onSettingsChange,
+            clipboardSync = clipboardSync,
+            onClipboardSyncChange = onClipboardSyncChange,
             update = update,
             onCheckForUpdates = onCheckForUpdates,
             onUpdate = {
@@ -653,12 +661,17 @@ private fun TalkButton(
     }
 }
 
-/** 设置：指针速度和滚动速度（松手时保存）、双指滚动和单指滚动的方向（选择时保存），最下面是版本号与检查更新。 */
+/**
+ * 设置：指针速度和滚动速度（松手时保存）、双指滚动和单指滚动的方向（选择时保存）、剪贴板同步的开关，
+ * 最下面是版本号与检查更新。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsSheet(
     settings: TouchpadSettings,
     onSettingsChange: (TouchpadSettings) -> Unit,
+    clipboardSync: Boolean?,
+    onClipboardSyncChange: (Boolean) -> Unit,
     update: UpdateState?,
     onCheckForUpdates: (force: Boolean) -> Unit,
     onUpdate: () -> Unit,
@@ -689,6 +702,7 @@ private fun SettingsSheet(
                 stripScroll = it
                 save()
             }
+            if (clipboardSync != null) ClipboardSyncRow(clipboardSync, onClipboardSyncChange)
             if (update != null) AboutRow(update, onCheck = { onCheckForUpdates(true) }, onUpdate = onUpdate)
         }
     }
@@ -697,8 +711,7 @@ private fun SettingsSheet(
 /** 一行滚动方向：左边是名称，右边在"自然"和"传统"里选一个，选中的反色。 */
 @Composable
 private fun ScrollDirectionChoice(label: String, value: ScrollDirection, onValueChange: (ScrollDirection) -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = EchoPadColors.Text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+    SettingRow(label) {
         SingleChoiceSegmentedButtonRow {
             ScrollDirection.entries.forEachIndexed { index, direction ->
                 SegmentedButton(
@@ -722,6 +735,25 @@ private fun ScrollDirectionChoice(label: String, value: ScrollDirection, onValue
     }
 }
 
+/** 一行剪贴板同步：左边是名称，右边是开关。 */
+@Composable
+private fun ClipboardSyncRow(enabled: Boolean, onEnabledChange: (Boolean) -> Unit) {
+    SettingRow("剪贴板同步") {
+        Switch(
+            checked = enabled,
+            onCheckedChange = onEnabledChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = EchoPadColors.Background,
+                checkedTrackColor = EchoPadColors.Text,
+                checkedBorderColor = EchoPadColors.Text,
+                uncheckedThumbColor = EchoPadColors.TextMuted,
+                uncheckedTrackColor = EchoPadColors.SurfaceRaised,
+                uncheckedBorderColor = EchoPadColors.SurfaceRaised,
+            ),
+        )
+    }
+}
+
 private val ScrollDirection.label: String
     get() = when (this) {
         ScrollDirection.Natural -> "自然"
@@ -730,8 +762,7 @@ private val ScrollDirection.label: String
 
 @Composable
 private fun SpeedSlider(label: String, value: Float, onValueChange: (Float) -> Unit, onValueChangeFinished: () -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = EchoPadColors.Text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+    SettingRow(label) {
         val tenths = (value * 10).roundToInt()
         Text("${tenths / 10}.${tenths % 10}×", color = EchoPadColors.TextMuted, style = MaterialTheme.typography.bodyMedium)
     }

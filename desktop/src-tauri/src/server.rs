@@ -1,11 +1,12 @@
-//! 手机端连接的 WebSocket 服务（ADR-0003、ADR-0004、ADR-0014、ADR-0015、docs/prd/pairing.md）。
+//! 手机端连接的 WebSocket 服务（ADR-0003、ADR-0004、ADR-0014、ADR-0015、docs/prd/pairing.md），
+//! 以及在手机端之间转发剪贴板（docs/prd/clipboard-sync.md）。
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -28,15 +29,17 @@ use tokio::{
     sync::{Notify, mpsc},
     time::timeout,
 };
+use socket2::{SockRef, TcpKeepalive};
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 use tower_service::Service;
 
 use crate::{
+    clipboard::{ClipboardSink, MAX_TEXT_BYTES, SyncedClipboard, now_millis},
     dictation::{DictationHandle, DictationService},
     input::{InputCommand, InputSink, Modifier, MouseButton, Owner, Shortcut, SpecialKey},
     pairing::{AuthOutcome, Credential, DeviceId, PairingStore, pairing_link},
     protocol::{
-        self, ClientMessage, DictationFailed, Hello, ModifierKey, OperatingSystem, Rejected, ServerMessage,
+        self, ClientMessage, ClipboardText, DictationFailed, Hello, ModifierKey, OperatingSystem, Rejected, ServerMessage,
         SwitchRequest, Welcome, button_action::Kind, client_message, hello, key_press, rejected, server_message, shortcut_action,
         zoom::Phase as ZoomPhase,
     },
@@ -49,8 +52,14 @@ pub const PROTOCOL_VERSION: u32 = protocol::ProtocolVersion::Current as u32;
 
 /// 连接建立后必须在这段时间内完成验证。
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-/// 手机端每 2 秒发一次心跳，超过这段时间收不到任何帧就认为已断线。
+/// 手机端每 2 秒发一次心跳。它有操作进行中时，超过这段时间收不到任何帧就认为已断线（ADR-0019）。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
+/// 其余时间靠 TCP 保活发现断线：30 秒没有数据开始探测，每 10 秒一次，3 次没有回应就断开（ADR-0019，
+/// 和 KDE Connect 电脑端的参数相同）。探测由手机的系统内核回应，手机休眠时连接保持。
+const KEEPALIVE: TcpKeepalive = TcpKeepalive::new()
+    .with_time(Duration::from_secs(30))
+    .with_interval(Duration::from_secs(10))
+    .with_retries(3);
 
 pub struct ServerContext {
     pub desktop_name: String,
@@ -63,6 +72,11 @@ pub struct ServerContext {
     pub input: Arc<dyn InputSink>,
     /// 缺少语音输入的配置时为 `None`；保存设置后会被替换，不用重启电脑端。
     dictation: RwLock<Option<Arc<dyn DictationService>>>,
+    clipboard: Arc<dyn ClipboardSink>,
+    /// 电脑端是否开着剪贴板同步，保存设置后更新。
+    clipboard_enabled: AtomicBool,
+    /// 电脑剪贴板上的内容和它最后更新的时间（ADR-0018）。写系统剪贴板也在这把锁里，几部手机同时发来的内容按顺序写入。
+    synced_clipboard: Mutex<SyncedClipboard>,
     /// 当前的连接：取消配对或同一部手机重新连上时据此关闭连接，让手机端切换过来时据此给它发消息。
     sessions: Mutex<HashMap<Owner, Session>>,
     next_session_id: AtomicU64,
@@ -72,6 +86,8 @@ struct Session {
     device: DeviceId,
     outbound: mpsc::UnboundedSender<ServerMessage>,
     close: Arc<Notify>,
+    /// 这部手机端是否开着剪贴板同步，它告诉电脑端之前当作关着。
+    clipboard_sync: bool,
 }
 
 impl ServerContext {
@@ -82,6 +98,7 @@ impl ServerContext {
         pairing: PairingStore,
         status: Arc<StatusHub>,
         input: Arc<dyn InputSink>,
+        clipboard: Arc<dyn ClipboardSink>,
     ) -> Self {
         let context = Self {
             desktop_name,
@@ -91,6 +108,9 @@ impl ServerContext {
             status,
             input,
             dictation: RwLock::new(None),
+            clipboard,
+            clipboard_enabled: AtomicBool::new(false),
+            synced_clipboard: Mutex::new(SyncedClipboard::unknown_since(now_millis())),
             sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
         };
@@ -150,6 +170,66 @@ impl ServerContext {
         *self.dictation.write().unwrap() = service;
     }
 
+    /// 打开剪贴板同步的那一刻起算，之前电脑上的复制都算旧的（ADR-0018）。
+    pub fn set_clipboard_enabled(&self, enabled: bool) {
+        if enabled && !self.clipboard_enabled() {
+            *self.synced_clipboard.lock().unwrap() = SyncedClipboard::unknown_since(now_millis());
+        }
+        self.clipboard_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn clipboard_enabled(&self) -> bool {
+        self.clipboard_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 用户在电脑上复制了文字（电脑端关着同步时不会读到）：和现有内容不同就发给所有开着剪贴板同步的在线手机端。
+    pub fn share_clipboard(&self, text: String) {
+        if text.len() > MAX_TEXT_BYTES {
+            return;
+        }
+        let copied = {
+            let mut synced = self.synced_clipboard.lock().unwrap();
+            if synced.text() == Some(text.as_str()) {
+                return;
+            }
+            synced.copy(text, now_millis())
+        };
+        self.send_clipboard(copied, None);
+    }
+
+    /// 一部手机端发来了剪贴板：比现有的新才写进电脑剪贴板，再转给其他开着同步的在线手机端，不发回给它。
+    fn receive_clipboard(&self, from: Owner, clipboard: ClipboardText) {
+        if !self.clipboard_enabled() || clipboard.text.len() > MAX_TEXT_BYTES {
+            return;
+        }
+        {
+            let mut synced = self.synced_clipboard.lock().unwrap();
+            if !synced.merge(&clipboard) {
+                return;
+            }
+            self.clipboard.write(&clipboard.text);
+        }
+        self.send_clipboard(clipboard, Some(from));
+    }
+
+    /// 发给开着剪贴板同步的在线手机端；`except` 是发来这条内容的连接，不发回给它。
+    fn send_clipboard(&self, clipboard: ClipboardText, except: Option<Owner>) {
+        let message = ServerMessage {
+            body: Some(server_message::Body::ClipboardText(clipboard)),
+        };
+        for (owner, session) in self.sessions.lock().unwrap().iter() {
+            if session.clipboard_sync && Some(*owner) != except {
+                let _ = session.outbound.send(message.clone());
+            }
+        }
+    }
+
+    fn set_clipboard_sync(&self, owner: Owner, enabled: bool) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(&owner) {
+            session.clipboard_sync = enabled;
+        }
+    }
+
     /// 把配过的手机端及是否在线告诉界面。
     fn publish_phones(&self) {
         let phones = self.pairing.lock().unwrap().phones();
@@ -182,6 +262,9 @@ pub async fn serve(listener: TcpListener, context: Arc<ServerContext>, tls: Arc<
                 continue;
             }
         };
+        if let Err(err) = SockRef::from(&stream).set_tcp_keepalive(&KEEPALIVE) {
+            tracing::warn!(%address, "failed to enable TCP keepalive: {err}");
+        }
         let acceptor = acceptor.clone();
         let router = router.clone();
         tokio::spawn(async move {
@@ -261,6 +344,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
                 device,
                 outbound: outbound.clone(),
                 close: close.clone(),
+                clipboard_sync: false,
             },
         );
     }
@@ -276,15 +360,22 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
         }
     });
 
-    let mut dictations: HashMap<u32, DictationHandle> = HashMap::new();
+    let mut ongoing = Ongoing::default();
     loop {
-        // 任何帧（包括心跳）都会重置超时；超时或出错都按断线处理。
+        // 有操作进行中时，任何帧（包括心跳）都会重置超时，超时按断线处理；其余时间由 TCP 保活发现断线（ADR-0019）。
+        let watched = ongoing.in_progress();
         let received = tokio::select! {
             _ = close.notified() => {
                 tracing::info!(device = %device_name, "connection closed by the desktop app");
                 break;
             }
-            received = timeout(IDLE_TIMEOUT, reader.next()) => received,
+            received = async {
+                if watched {
+                    timeout(IDLE_TIMEOUT, reader.next()).await
+                } else {
+                    Ok(reader.next().await)
+                }
+            } => received,
         };
         let frame = match received {
             Ok(Some(Ok(frame))) => frame,
@@ -293,6 +384,8 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
                 break;
             }
             Ok(None) => break,
+            // 等的时候进行中的操作已经结束（例如语音输入整理完了），之后不再看心跳。
+            Err(_) if !ongoing.in_progress() => continue,
             Err(_) => {
                 tracing::debug!("heartbeat timed out");
                 break;
@@ -301,7 +394,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
         match frame {
             Message::Binary(bytes) => match ClientMessage::decode(bytes) {
                 Ok(ClientMessage { body: Some(body) }) => {
-                    dispatch(&context, session_id, body, &mut dictations, &outbound);
+                    dispatch(&context, session_id, body, &mut ongoing, &outbound);
                 }
                 Ok(ClientMessage { body: None }) => {}
                 Err(err) => tracing::warn!("ignored malformed message: {err}"),
@@ -313,7 +406,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
 
     // 断线收尾：只松开这部手机按住的鼠标键，丢弃它未完成的语音输入。
     context.input.send(InputCommand::ReleaseAll { owner: session_id });
-    drop(dictations);
+    drop(ongoing);
     forward.abort();
     context.sessions.lock().unwrap().remove(&session_id);
     context.publish_phones();
@@ -368,11 +461,26 @@ const OPERATING_SYSTEM: OperatingSystem = if cfg!(target_os = "macos") {
     OperatingSystem::Windows
 };
 
+/// 一部手机端进行中的操作：按住的鼠标键、缩放和语音输入。有操作进行中时电脑端看心跳（ADR-0019）。
+#[derive(Default)]
+struct Ongoing {
+    buttons: HashSet<MouseButton>,
+    zooming: bool,
+    dictations: HashMap<u32, DictationHandle>,
+}
+
+impl Ongoing {
+    fn in_progress(&mut self) -> bool {
+        self.dictations.retain(|_, handle| !handle.is_finished());
+        !self.buttons.is_empty() || self.zooming || !self.dictations.is_empty()
+    }
+}
+
 fn dispatch(
     context: &ServerContext,
     owner: Owner,
     body: client_message::Body,
-    dictations: &mut HashMap<u32, DictationHandle>,
+    ongoing: &mut Ongoing,
     outbound: &mpsc::UnboundedSender<ServerMessage>,
 ) {
     use client_message::Body;
@@ -393,8 +501,14 @@ fn dispatch(
             let command = match action.kind() {
                 Kind::Click => InputCommand::Click { button, modifiers },
                 Kind::DoubleClick => InputCommand::DoubleClick { button, modifiers },
-                Kind::Press => InputCommand::Press { owner, button, modifiers },
-                Kind::Release => InputCommand::Release { owner, button },
+                Kind::Press => {
+                    ongoing.buttons.insert(button);
+                    InputCommand::Press { owner, button, modifiers }
+                }
+                Kind::Release => {
+                    ongoing.buttons.remove(&button);
+                    InputCommand::Release { owner, button }
+                }
                 Kind::Unspecified => return,
             };
             context.input.send(command);
@@ -405,23 +519,28 @@ fn dispatch(
         }),
         Body::Zoom(zoom) => {
             let command = match zoom.phase() {
-                ZoomPhase::Began => InputCommand::ZoomStart { owner },
+                ZoomPhase::Began => {
+                    ongoing.zooming = true;
+                    InputCommand::ZoomStart { owner }
+                }
                 ZoomPhase::Changed => InputCommand::Zoom {
                     owner,
                     magnification: zoom.magnification,
                 },
-                ZoomPhase::Ended => InputCommand::ZoomEnd { owner },
+                ZoomPhase::Ended => {
+                    ongoing.zooming = false;
+                    InputCommand::ZoomEnd { owner }
+                }
                 ZoomPhase::Unspecified => return,
             };
             context.input.send(command);
         }
         Body::DictationStart(start) => {
-            dictations.retain(|_, handle| !handle.is_finished());
             let service = context.dictation.read().unwrap().clone();
             match service {
                 Some(service) => {
                     let handle = service.start(start.session_id, context.input.clone(), outbound.clone());
-                    dictations.insert(start.session_id, handle);
+                    ongoing.dictations.insert(start.session_id, handle);
                 }
                 None => {
                     let _ = outbound.send(ServerMessage {
@@ -434,18 +553,18 @@ fn dispatch(
             }
         }
         Body::AudioChunk(chunk) => {
-            if let Some(handle) = dictations.get(&chunk.session_id) {
+            if let Some(handle) = ongoing.dictations.get(&chunk.session_id) {
                 handle.push_audio(chunk.pcm);
             }
         }
         Body::DictationStop(stop) => {
-            if let Some(handle) = dictations.get(&stop.session_id) {
+            if let Some(handle) = ongoing.dictations.get(&stop.session_id) {
                 handle.finish();
             }
         }
         // 丢弃进行中的语音输入：识别和整理都停下，什么都不上屏。
         Body::DictationCancel(cancel) => {
-            dictations.remove(&cancel.session_id);
+            ongoing.dictations.remove(&cancel.session_id);
         }
         Body::TypeText(typed) => {
             if !typed.text.is_empty() {
@@ -470,6 +589,8 @@ fn dispatch(
                 context.input.send(InputCommand::Shortcut(shortcut));
             }
         }
+        Body::ClipboardSyncSetting(setting) => context.set_clipboard_sync(owner, setting.enabled),
+        Body::ClipboardText(clipboard) => context.receive_clipboard(owner, clipboard),
     }
 }
 
@@ -555,8 +676,8 @@ mod tests {
         certificate::{CERTIFICATE_NAME, DesktopCertificate},
         dictation::{AudioFrame, Cleaner, Outbound, RecognitionEvent, run_pipeline},
         protocol::{
-            AudioChunk, ButtonAction, CharacterPress, DictationCancel, DictationStart, DictationStop, KeyPress,
-            PointerMove, ShortcutAction, TypeText, Zoom,
+            AudioChunk, ButtonAction, CharacterPress, ClipboardSyncSetting, DictationCancel, DictationStart, DictationStop,
+            KeyPress, PointerMove, ShortcutAction, TypeText, Zoom,
         },
     };
 
@@ -573,6 +694,21 @@ mod tests {
 
     impl RecordingInput {
         fn commands(&self) -> Vec<InputCommand> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingClipboard(Mutex<Vec<String>>);
+
+    impl ClipboardSink for RecordingClipboard {
+        fn write(&self, text: &str) {
+            self.0.lock().unwrap().push(text.to_owned());
+        }
+    }
+
+    impl RecordingClipboard {
+        fn written(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
         }
     }
@@ -658,6 +794,7 @@ mod tests {
     struct Harness {
         context: Arc<ServerContext>,
         input: Arc<RecordingInput>,
+        clipboard: Arc<RecordingClipboard>,
         address: SocketAddr,
         certificate: CertificateDer<'static>,
     }
@@ -668,6 +805,7 @@ mod tests {
         let pairing = PairingStore::load(dir.join("paired-devices.json")).unwrap();
         let host = IpAddr::from(Ipv4Addr::LOCALHOST);
         let input = Arc::new(RecordingInput::default());
+        let clipboard = Arc::new(RecordingClipboard::default());
         let status = Arc::new(StatusHub::new(|_| {}));
         let context = Arc::new(ServerContext::new(
             "Test Mac".into(),
@@ -676,14 +814,17 @@ mod tests {
             pairing,
             status,
             input.clone(),
+            clipboard.clone(),
         ));
         context.set_dictation(dictation);
+        context.set_clipboard_enabled(true);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(serve(listener, context.clone(), certificate.server_config().unwrap()));
         Harness {
             context,
             input,
+            clipboard,
             address,
             certificate: certificate.der().clone(),
         }
@@ -760,6 +901,24 @@ mod tests {
             self.wait_for_input(|command| matches!(command, InputCommand::ReleaseAll { .. })).await;
         }
 
+        /// 等电脑端记下有几部手机端开着剪贴板同步。
+        async fn wait_for_clipboard_sync(&self, expected: usize) {
+            for _ in 0..100 {
+                let count = self.context.sessions.lock().unwrap().values().filter(|session| session.clipboard_sync).count();
+                if count == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("{expected} phones never turned on clipboard sync");
+        }
+
+        /// 等电脑端处理完这部手机端之前发来的消息：同一条连接上的消息按顺序处理。
+        async fn wait_until_handled(&self, client: &mut Client) {
+            send(client, client_message::Body::PointerMove(PointerMove { dx: 1.0, dy: 0.0 })).await;
+            self.wait_for_input(|command| matches!(command, InputCommand::Move { .. })).await;
+        }
+
         /// 等电脑端发出符合 `expected` 的键鼠操作。
         async fn wait_for_input(&self, expected: impl Fn(&InputCommand) -> bool) {
             for _ in 0..100 {
@@ -788,6 +947,152 @@ mod tests {
 
     async fn paired_client(harness: &Harness) -> Client {
         harness.pair("phone-1").await.0
+    }
+
+    /// 一会儿之内电脑端没有给这部手机端发任何消息。
+    async fn assert_nothing_received(client: &mut Client) {
+        let next = timeout(Duration::from_millis(200), client.next()).await;
+        assert!(next.is_err(), "unexpected message: {next:?}");
+    }
+
+    async fn set_clipboard_sync(client: &mut Client, enabled: bool) {
+        send(client, client_message::Body::ClipboardSyncSetting(ClipboardSyncSetting { enabled })).await;
+    }
+
+    /// 电脑端打开同步之后的某个时刻。
+    fn later(millis: i64) -> i64 {
+        now_millis() + millis
+    }
+
+    fn clipboard(text: &str, updated_at: i64) -> ClipboardText {
+        ClipboardText { text: text.into(), updated_at }
+    }
+
+    async fn send_clipboard(client: &mut Client, clipboard: &ClipboardText) {
+        send(client, client_message::Body::ClipboardText(clipboard.clone())).await;
+    }
+
+    #[tokio::test]
+    async fn newer_clipboard_from_a_phone_reaches_the_desktop_and_other_phones_with_sync_on() {
+        let harness = start_server(None).await;
+        let (mut sender, _) = harness.pair("phone-1").await;
+        let (mut syncing, _) = harness.pair("phone-2").await;
+        let (mut not_syncing, _) = harness.pair("phone-3").await;
+        set_clipboard_sync(&mut sender, true).await;
+        set_clipboard_sync(&mut syncing, true).await;
+        harness.wait_for_clipboard_sync(2).await;
+
+        let copied = clipboard("hello", later(1_000));
+        send_clipboard(&mut sender, &copied).await;
+        assert_eq!(receive(&mut syncing).await, server_message::Body::ClipboardText(copied));
+        assert_eq!(harness.clipboard.written(), ["hello"]);
+        assert_nothing_received(&mut sender).await;
+        assert_nothing_received(&mut not_syncing).await;
+    }
+
+    #[tokio::test]
+    async fn clipboard_that_is_not_newer_stops_here() {
+        let harness = start_server(None).await;
+        let (mut first, _) = harness.pair("phone-1").await;
+        let (mut second, _) = harness.pair("phone-2").await;
+        set_clipboard_sync(&mut first, true).await;
+        set_clipboard_sync(&mut second, true).await;
+        harness.wait_for_clipboard_sync(2).await;
+
+        let copied = clipboard("hello", later(1_000));
+        send_clipboard(&mut first, &copied).await;
+        assert!(matches!(receive(&mut second).await, server_message::Body::ClipboardText(_)));
+        // 同一条内容经别的电脑转了一圈回来，以及更早的内容，都不再写入、也不再转发。
+        send_clipboard(&mut second, &copied).await;
+        send_clipboard(&mut second, &clipboard("older", later(500))).await;
+        harness.wait_until_handled(&mut second).await;
+        assert_eq!(harness.clipboard.written(), ["hello"]);
+        assert_nothing_received(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn clipboard_copied_on_two_phones_at_once_settles_on_the_newer_one() {
+        let harness = start_server(None).await;
+        let (mut first, _) = harness.pair("phone-1").await;
+        let (mut second, _) = harness.pair("phone-2").await;
+        set_clipboard_sync(&mut first, true).await;
+        set_clipboard_sync(&mut second, true).await;
+        harness.wait_for_clipboard_sync(2).await;
+
+        let newer = clipboard("newer", later(2_000));
+        send_clipboard(&mut first, &newer).await;
+        send_clipboard(&mut second, &clipboard("older", later(1_000))).await;
+        harness.wait_until_handled(&mut first).await;
+        harness.wait_until_handled(&mut second).await;
+        assert_eq!(harness.clipboard.written().last().map(String::as_str), Some("newer"));
+        assert_eq!(receive(&mut second).await, server_message::Body::ClipboardText(newer));
+    }
+
+    #[tokio::test]
+    async fn text_copied_on_the_desktop_reaches_phones_with_sync_on() {
+        let harness = start_server(None).await;
+        let (mut syncing, _) = harness.pair("phone-1").await;
+        let (mut not_syncing, _) = harness.pair("phone-2").await;
+        set_clipboard_sync(&mut syncing, true).await;
+        harness.wait_for_clipboard_sync(1).await;
+
+        let before = now_millis();
+        harness.context.share_clipboard("copied".into());
+        let server_message::Body::ClipboardText(copied) = receive(&mut syncing).await else {
+            panic!("expected the clipboard");
+        };
+        assert_eq!(copied.text, "copied");
+        assert!(copied.updated_at >= before);
+        assert_nothing_received(&mut not_syncing).await;
+
+        // 内容没变不算复制；太长的文字不同步。
+        harness.context.share_clipboard("copied".into());
+        harness.context.share_clipboard("x".repeat(MAX_TEXT_BYTES + 1));
+        assert_nothing_received(&mut syncing).await;
+    }
+
+    #[tokio::test]
+    async fn earlier_copies_are_not_sent_when_a_phone_turns_sync_on() {
+        let harness = start_server(None).await;
+        let mut client = paired_client(&harness).await;
+        harness.context.share_clipboard("copied before the phone turned sync on".into());
+
+        // 重连或者打开同步时都会发这条消息；之前的复制不补发，之后的照常推送。
+        set_clipboard_sync(&mut client, true).await;
+        harness.wait_for_clipboard_sync(1).await;
+        assert_nothing_received(&mut client).await;
+        harness.context.share_clipboard("copied afterwards".into());
+        let server_message::Body::ClipboardText(copied) = receive(&mut client).await else {
+            panic!("expected the clipboard");
+        };
+        assert_eq!(copied.text, "copied afterwards");
+    }
+
+    #[tokio::test]
+    async fn a_phone_can_turn_clipboard_sync_off_again() {
+        let harness = start_server(None).await;
+        let mut client = paired_client(&harness).await;
+        set_clipboard_sync(&mut client, true).await;
+        harness.wait_for_clipboard_sync(1).await;
+        set_clipboard_sync(&mut client, false).await;
+        harness.wait_for_clipboard_sync(0).await;
+
+        harness.context.share_clipboard("copied".into());
+        assert_nothing_received(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn a_desktop_with_clipboard_sync_off_ignores_clipboard_from_phones() {
+        let harness = start_server(None).await;
+        harness.context.set_clipboard_enabled(false);
+        let mut client = paired_client(&harness).await;
+        set_clipboard_sync(&mut client, true).await;
+        harness.wait_for_clipboard_sync(1).await;
+
+        send_clipboard(&mut client, &clipboard("hello", later(1_000))).await;
+        harness.wait_until_handled(&mut client).await;
+        assert!(harness.clipboard.written().is_empty());
+        assert_nothing_received(&mut client).await;
     }
 
     #[tokio::test]

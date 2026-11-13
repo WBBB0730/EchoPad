@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">EchoPad</string>
+    <!-- 下拉菜单里的磁贴（docs/prd/clipboard-sync.md）。 -->
+    <string name="sync_clipboard">同步剪贴板</string>
+    <!-- 文字选择菜单和分享菜单里的一项。 -->
+    <string name="sync_to_echopad">同步到 EchoPad</string>
 </resources>

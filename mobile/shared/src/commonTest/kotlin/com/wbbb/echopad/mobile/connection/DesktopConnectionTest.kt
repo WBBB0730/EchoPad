@@ -5,6 +5,8 @@ import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.pairing.SavedPairing
 import com.wbbb.echopad.mobile.protocol.ClientMessage
+import com.wbbb.echopad.mobile.protocol.ClipboardSyncSetting
+import com.wbbb.echopad.mobile.protocol.ClipboardText
 import com.wbbb.echopad.mobile.protocol.OperatingSystem
 import com.wbbb.echopad.mobile.protocol.PointerMove
 import com.wbbb.echopad.mobile.protocol.Rejected
@@ -35,6 +37,8 @@ class DesktopConnectionTest {
     private val transport = FakeTransport()
     private val finder = FakeFinder()
     private val networkChanges = MutableSharedFlow<Unit>()
+    /** 每条连接验证配对后先发出的消息。 */
+    private var greeting = emptyList<ClientMessage>()
     private val move = ClientMessage(pointer_move = PointerMove(dx = 1f, dy = 2f))
 
     @Test
@@ -386,8 +390,65 @@ class DesktopConnectionTest {
         assertEquals(home.host, transport.sessions.tryReceive().getOrNull()?.host)
     }
 
+    @Test
+    fun itTellsWhetherAnyDesktopIsPairedOnceTheSavedPairingIsRead() = runTest {
+        val loaded = CompletableDeferred<Unit>()
+        val memory = MemoryStore()
+        val connection = connect(object : PairedDesktopStore by memory {
+            override suspend fun load(): SavedPairing {
+                loaded.await()
+                return memory.load()
+            }
+        })
+        runCurrent()
+        assertEquals(null, connection.hasDesktops.value)
+        loaded.complete(Unit)
+        runCurrent()
+        assertEquals(false, connection.hasDesktops.value)
+
+        connection.pair(PairingLink("192.168.1.9", 47321, "token", "desk-9", "fingerprint-9"))
+        val session = transport.sessions.receive()
+        session.hello()
+        session.reply(ServerMessage(welcome = Welcome(desktop_name = "Office Mac", device_key = "new-key", desktop_id = "desk-9")))
+        runCurrent()
+        assertEquals(true, connection.hasDesktops.value)
+    }
+
+    @Test
+    fun everyConnectionStartsWithTheGreeting() = runTest {
+        val setting = ClientMessage(clipboard_sync_setting = ClipboardSyncSetting(enabled = true))
+        greeting = listOf(setting)
+        val connection = connect(MemoryStore(home))
+        val session = welcome(transport.sessions.receive(), "Mac")
+        assertTrue(connection.desktops.value.single().online)
+        assertEquals(setting, ClientMessage.ADAPTER.decode(session.sent.receive()))
+    }
+
+    @Test
+    fun clipboardGoesToOnlineDesktopsAndComesFromAnyOfThem() = runTest {
+        val connection = connect(MemoryStore(home, office))
+        val received = mutableListOf<DesktopClipboard>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { connection.clipboardTexts.toList(received) }
+        val homeSession = welcome(transport.sessions.receive(), "Mac")
+        val officeSession = welcome(transport.sessions.receive(), "Office")
+
+        val clipboard = ClientMessage(clipboard_text = ClipboardText(text = "hello", updated_at = 1_000))
+        assertEquals(listOf(home.id, office.id), connection.sendToAll(clipboard).sorted())
+        runCurrent()
+        assertEquals(clipboard, ClientMessage.ADAPTER.decode(homeSession.sent.receive()))
+        assertEquals(clipboard, ClientMessage.ADAPTER.decode(officeSession.sent.receive()))
+        // 转发时不发回给来源。
+        assertEquals(listOf(home.id), connection.sendToAll(clipboard, except = office.id))
+
+        // 不是当前电脑发来的剪贴板也收，并记下是哪台发来的。
+        val fromOffice = ClipboardText(text = "from office", updated_at = 2_000)
+        officeSession.reply(ServerMessage(clipboard_text = fromOffice))
+        runCurrent()
+        assertEquals(listOf(DesktopClipboard(office.id, fromOffice)), received)
+    }
+
     private fun TestScope.connect(store: PairedDesktopStore) =
-        DesktopConnection(store, "Phone", transport, backgroundScope, finder, networkChanges)
+        DesktopConnection(store, "Phone", transport, backgroundScope, finder, networkChanges, greeting = { greeting })
 
     /** 电脑端验证通过，回复欢迎。 */
     private suspend fun TestScope.welcome(session: FakeSession, name: String): FakeSession {

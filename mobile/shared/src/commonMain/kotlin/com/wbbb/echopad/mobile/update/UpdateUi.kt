@@ -20,18 +20,13 @@ import androidx.compose.ui.unit.dp
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownColor
 import com.wbbb.echopad.mobile.ui.EchoPadColors
+import com.wbbb.echopad.mobile.ui.SettingRow
 
 /** 设置面板最下面一行：版本号与检查更新。已有可以安装的更新时写"立即更新"；检查或下载期间只置灰，不换文字。 */
 @Composable
 fun AboutRow(state: UpdateState, onCheck: () -> Unit, onUpdate: () -> Unit) {
     val busy = state.phase == UpdatePhase.Checking || state.phase == UpdatePhase.Downloading
-    Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            "版本 ${state.currentVersion}",
-            color = EchoPadColors.Text,
-            style = MaterialTheme.typography.bodyLarge,
-            modifier = Modifier.weight(1f),
-        )
+    SettingRow("版本 ${state.currentVersion}") {
         TextButton(onClick = if (state.prompt) onUpdate else onCheck, enabled = !busy) {
             Text(
                 if (state.prompt) "立即更新" else "检查更新",
