@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInstaller
+import android.os.Build
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
@@ -48,7 +49,8 @@ class AndroidAppPackages(private val context: Context) : AppPackages {
     override suspend fun install(): InstallResult {
         val packageManager = context.packageManager
         // 还没允许"安装未知应用"：先带用户去系统设置，允许之后回来再点一次更新。
-        if (!packageManager.canRequestPackageInstalls()) {
+        // Android 8 以下没有这项按应用的权限，由系统安装界面按"未知来源"总开关处理。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
             context.startActivity(
                 Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, "package:${context.packageName}".toUri())
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
