@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { Toaster } from "@/components/ui/sonner";
 import "./index.css";
 
 // 跟随系统的浅色或深色模式。
@@ -12,5 +13,6 @@ darkScheme.addEventListener("change", applyScheme);
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <App />
+    <Toaster />
   </React.StrictMode>,
 );

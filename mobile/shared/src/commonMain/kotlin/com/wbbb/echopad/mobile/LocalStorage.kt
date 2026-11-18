@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import com.wbbb.echopad.mobile.clipboard.ClipboardSettings
 import com.wbbb.echopad.mobile.pairing.PairedDesktop
 import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.SavedPairing
@@ -26,7 +27,7 @@ import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 
 /**
- * 手机端保存在本机的数据：配过的电脑端、当前电脑、手机端标识、触控板设置、剪贴板同步的开关，共用一个 DataStore 文件。
+ * 手机端保存在本机的数据：配过的电脑端、当前电脑、手机端标识、触控板设置、剪贴板同步设置，共用一个 DataStore 文件。
  * 同一个文件在一个进程里只能有一个 DataStore，调用方需保证每个文件只创建一次。
  */
 class LocalStorage private constructor(private val preferences: DataStore<Preferences>) {
@@ -96,11 +97,20 @@ class LocalStorage private constructor(private val preferences: DataStore<Prefer
         }
     }
 
-    /** 剪贴板同步默认开着（docs/prd/clipboard-sync.md）。 */
-    val clipboardSync: Flow<Boolean> = preferences.data.map { values -> values[CLIPBOARD_SYNC] ?: true }
+    /** 没设置过时取 [ClipboardSettings] 的默认值。 */
+    val clipboardSettings: Flow<ClipboardSettings> = preferences.data.map { values ->
+        val defaults = ClipboardSettings()
+        ClipboardSettings(
+            autoSend = values[CLIPBOARD_AUTO_SEND] ?: defaults.autoSend,
+            receive = values[CLIPBOARD_RECEIVE] ?: defaults.receive,
+        )
+    }
 
-    suspend fun setClipboardSync(enabled: Boolean) {
-        preferences.edit { values -> values[CLIPBOARD_SYNC] = enabled }
+    suspend fun setClipboardSettings(settings: ClipboardSettings) {
+        preferences.edit { values ->
+            values[CLIPBOARD_AUTO_SEND] = settings.autoSend
+            values[CLIPBOARD_RECEIVE] = settings.receive
+        }
     }
 
     /** 常驻通知要用的通知权限只请求一次（docs/prd/pairing.md）；第一次调用返回 true，之后都返回 false。 */
@@ -127,7 +137,8 @@ class LocalStorage private constructor(private val preferences: DataStore<Prefer
         /** 滚动方向存成是不是自然，不存枚举的名字，免得改名后读不出来。 */
         private val TWO_FINGER_SCROLL_NATURAL = booleanPreferencesKey("two_finger_scroll_natural")
         private val STRIP_SCROLL_NATURAL = booleanPreferencesKey("strip_scroll_natural")
-        private val CLIPBOARD_SYNC = booleanPreferencesKey("clipboard_sync")
+        private val CLIPBOARD_AUTO_SEND = booleanPreferencesKey("clipboard_auto_send")
+        private val CLIPBOARD_RECEIVE = booleanPreferencesKey("clipboard_receive")
         private val NOTIFICATION_REQUESTED = booleanPreferencesKey("notification_requested")
 
         /** 数据保存在 [path] 指向的文件里。 */

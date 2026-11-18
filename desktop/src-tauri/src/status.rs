@@ -17,7 +17,7 @@ pub struct Status {
     /// 尚未检查时为 `None`。
     pub input_permission: Option<bool>,
     pub dictation_ready: bool,
-    /// 开着剪贴板同步，而系统一律拒绝 EchoPad 读取剪贴板（ADR-0017）。
+    /// 开着剪贴板自动发送，而系统一律拒绝 EchoPad 读取剪贴板（ADR-0017）。
     pub clipboard_access_denied: bool,
 }
 

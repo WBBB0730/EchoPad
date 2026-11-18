@@ -42,13 +42,16 @@ pub struct CleanupSettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipboardSettings {
-    pub enabled: bool,
+    /// 电脑上复制的文字自动发给手机端。
+    pub auto_send: bool,
+    /// 手机端同步来的文字写进电脑剪贴板。关着时照样转给其他手机端（ADR-0018）。
+    pub receive: bool,
 }
 
-/// 剪贴板同步默认开着。
+/// 剪贴板同步默认都开着。
 impl Default for ClipboardSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { auto_send: true, receive: true }
     }
 }
 
@@ -516,11 +519,14 @@ mod tests {
         });
         fs::write(&path, file.to_string()).unwrap();
         let store = SettingsStore::load(path.clone()).unwrap();
-        assert!(store.get().clipboard.enabled);
+        assert_eq!(store.get().clipboard, ClipboardSettings { auto_send: true, receive: true });
 
         let mut settings = store.get();
-        settings.clipboard.enabled = false;
+        settings.clipboard.receive = false;
         store.save(settings).unwrap();
-        assert!(!SettingsStore::load(path).unwrap().get().clipboard.enabled);
+        assert_eq!(
+            SettingsStore::load(path).unwrap().get().clipboard,
+            ClipboardSettings { auto_send: true, receive: false }
+        );
     }
 }

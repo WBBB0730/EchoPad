@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 通知和状态栏的小图标：和主题图标同一个图形（实心圆点加两圈细环），按状态栏图标的规格占满 24dp 画布的中间 20dp -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="64"
+    android:viewportHeight="64">
+    <group
+        android:translateX="-22"
+        android:translateY="-22">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M54,47a7,7 0,1 1,0 14a7,7 0,1 1,0 -14z" />
+        <path
+            android:pathData="M54,37.5a16.5,16.5 0,1 1,0 33a16.5,16.5 0,1 1,0 -33z"
+            android:strokeWidth="3.3"
+            android:strokeColor="#FFFFFF" />
+        <path
+            android:pathData="M54,28.3a25.7,25.7 0,1 1,0 51.4a25.7,25.7 0,1 1,0 -51.4z"
+            android:strokeWidth="2.3"
+            android:strokeColor="#FFFFFF" />
+    </group>
+</vector>

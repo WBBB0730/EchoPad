@@ -2,6 +2,8 @@ package com.wbbb.echopad.mobile
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.wbbb.echopad.mobile.clipboard.ClipboardSettings
+import com.wbbb.echopad.mobile.clipboard.message
 import com.wbbb.echopad.mobile.connection.ConnectionNotice
 import com.wbbb.echopad.mobile.dictation.DictationController
 import com.wbbb.echopad.mobile.pairing.PairingLink
@@ -21,13 +23,18 @@ import kotlinx.coroutines.launch
 class EchoPadViewModel(core: EchoPadCore) : ViewModel() {
     private val storage = core.storage
     val connection = core.connection
-    val clipboardSync = core.clipboardSync
+    private val clipboardSync = core.clipboardSync
     val dictation = DictationController(connection, viewModelScope)
     val keyboard = KeyboardInput(connection)
     val updater = core.platform.packages?.let(::AppUpdater)
 
     val touchpadSettings: StateFlow<TouchpadSettings> =
         storage.touchpadSettings.stateIn(viewModelScope, SharingStarted.Eagerly, TouchpadSettings())
+
+    /** 剪贴板同步设置；平台不支持剪贴板时（iOS 版还没有）为 null，设置里不显示这一项。 */
+    val clipboardSettings: StateFlow<ClipboardSettings>? = clipboardSync?.let {
+        storage.clipboardSettings.stateIn(viewModelScope, SharingStarted.Eagerly, ClipboardSettings())
+    }
 
     private val _notices = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
@@ -38,7 +45,7 @@ class EchoPadViewModel(core: EchoPadCore) : ViewModel() {
             when (notice) {
                 ConnectionNotice.PairingCodeRejected -> "配对码已失效，请重新扫码"
                 is ConnectionNotice.PairingRevoked -> "${notice.desktopName} 已取消和这部手机的配对"
-                is ConnectionNotice.SwitchedByDesktop -> "已切换到 ${notice.desktopName}"
+                is ConnectionNotice.Switched -> "已切换到 ${notice.desktopName}"
             }
         },
         dictation.failures,
@@ -53,8 +60,16 @@ class EchoPadViewModel(core: EchoPadCore) : ViewModel() {
         viewModelScope.launch { storage.setTouchpadSettings(settings) }
     }
 
-    fun setClipboardSync(enabled: Boolean) {
-        viewModelScope.launch { storage.setClipboardSync(enabled) }
+    fun setClipboardSettings(settings: ClipboardSettings) {
+        viewModelScope.launch { storage.setClipboardSettings(settings) }
+    }
+
+    /** 平台支持剪贴板时（iOS 版还没有）才有 EchoPad 里的"同步剪贴板"按钮。 */
+    val canSyncClipboard: Boolean get() = clipboardSync != null
+
+    /** EchoPad 里的"同步剪贴板"：读手机剪贴板发给所有在线的电脑，结果用 Snackbar 提示。 */
+    fun syncClipboard() {
+        clipboardSync?.let { notify(it.syncClipboard().message) }
     }
 
     /** 打开设置时 [force] 为 false，距上次检查不足 5 分钟就跳过；手动检查为 true。 */

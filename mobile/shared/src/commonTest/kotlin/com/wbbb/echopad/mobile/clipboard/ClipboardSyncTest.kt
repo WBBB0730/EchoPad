@@ -8,7 +8,6 @@ import com.wbbb.echopad.mobile.connection.MemoryStore
 import com.wbbb.echopad.mobile.connection.pairedDesktop
 import com.wbbb.echopad.mobile.pairing.PairedDesktop
 import com.wbbb.echopad.mobile.protocol.ClientMessage
-import com.wbbb.echopad.mobile.protocol.ClipboardSyncSetting
 import com.wbbb.echopad.mobile.protocol.ClipboardText
 import com.wbbb.echopad.mobile.protocol.ServerMessage
 import com.wbbb.echopad.mobile.protocol.Welcome
@@ -28,7 +27,7 @@ class ClipboardSyncTest {
     private val home = pairedDesktop("desk-1", "Mac", "192.168.1.2")
     private val office = pairedDesktop("desk-2", "Office", "192.168.1.3")
     private val transport = FakeTransport()
-    private val setting = MutableStateFlow<Boolean?>(true)
+    private val settings = MutableStateFlow<ClipboardSettings?>(ClipboardSettings())
     private val clipboard = FakeClipboard()
 
     /** 手机的时钟，Unix 毫秒。 */
@@ -76,9 +75,8 @@ class ClipboardSyncTest {
             backgroundScope,
             FakeFinder(),
             MutableSharedFlow(),
-            greeting = { ClipboardSync.greeting(enabled = setting.value == true) },
         )
-        val sync = ClipboardSync(connection, setting, clipboard, backgroundScope, now = { clock })
+        val sync = ClipboardSync(connection, settings, clipboard, backgroundScope, now = { clock })
         runCurrent()
         return sync
     }
@@ -102,7 +100,6 @@ class ClipboardSyncTest {
 
     private fun message(clipboard: ClipboardText) = ClientMessage(clipboard_text = clipboard)
 
-    private fun setting(enabled: Boolean) = ClientMessage(clipboard_sync_setting = ClipboardSyncSetting(enabled = enabled))
 
     private fun FakeSession.send(clipboard: ClipboardText) = reply(ServerMessage(clipboard_text = clipboard))
 
@@ -111,8 +108,6 @@ class ClipboardSyncTest {
         val sync = start(home, office)
         val homeSession = welcome("Mac")
         val officeSession = welcome("Office")
-        assertEquals(listOf(setting(true)), sent(homeSession))
-        assertEquals(listOf(setting(true)), sent(officeSession))
 
         clock = 20_000
         clipboard.content = "hello"
@@ -138,9 +133,9 @@ class ClipboardSyncTest {
         clipboard.content = "hello"
         assertEquals(SyncResult.NoDesktopOnline, sync.syncClipboard())
 
-        // 连上时只告诉电脑端同步开着，断线期间的复制不补发。
+        // 断线期间的复制，连上后不补发。
         val session = welcome("Mac")
-        assertEquals(listOf(setting(true)), sent(session))
+        assertEquals(emptyList(), sent(session))
     }
 
     @Test
@@ -209,37 +204,38 @@ class ClipboardSyncTest {
     }
 
     @Test
-    fun turningSyncOnTellsTheDesktopsAndTreatsEarlierCopiesAsOld() = runTest {
-        setting.value = false
-        start(home)
-        val session = welcome("Mac")
-        assertEquals(emptyList(), sent(session))
+    fun withReceivingOffClipboardIsNotWrittenButStillPassedOn() = runTest {
+        settings.value = ClipboardSettings(receive = false)
+        start(home, office)
+        val homeSession = welcome("Mac")
+        val officeSession = welcome("Office")
 
-        clock = 20_000
-        setting.value = true
-        runCurrent()
-        assertEquals(listOf(setting(true)), sent(session))
-        // 打开同步之前复制的内容（例如转发途中的旧内容）不再写入。
-        session.send(clipboard("copied while sync was off", 15_000))
+        homeSession.send(clipboard("from the mac", 30_000))
         runCurrent()
         assertEquals(emptyList(), clipboard.written)
+        assertEquals(listOf(message(clipboard("from the mac", 30_000))), sent(officeSession))
+        // 同一条内容转了一圈回来，照样停下。
+        officeSession.send(clipboard("from the mac", 30_000))
+        runCurrent()
+        assertEquals(emptyList(), sent(homeSession))
     }
 
     @Test
-    fun turnedOffItNeitherReadsNorSendsNorWrites() = runTest {
-        setting.value = false
+    fun withAutoSendOffOnlySyncingOnPurposeSends() = runTest {
+        settings.value = ClipboardSettings(autoSend = false)
         val sync = start(home)
         val session = welcome("Mac")
         clipboard.copy("copied on the phone")
 
-        assertEquals(SyncResult.Disabled, sync.syncClipboard())
-        assertEquals(SyncResult.Disabled, sync.syncText("selected"))
+        // 回到 EchoPad 时不读剪贴板。
         sync.syncOnReturn()
-        session.send(clipboard("from the mac", 30_000))
-        runCurrent()
         assertEquals(0, clipboard.reads)
-        assertEquals(emptyList(), clipboard.written)
         assertEquals(emptyList(), sent(session))
+
+        // 用户主动同步照常发出。
+        clock = 40_000
+        assertEquals(SyncResult.Sent(listOf("Mac")), sync.syncClipboard())
+        assertEquals(listOf(message(clipboard("copied on the phone", 40_000))), sent(session))
     }
 
     @Test
@@ -266,16 +262,17 @@ class ClipboardSyncTest {
     }
 
     @Test
-    fun syncingRightAfterStartingWaitsForTheSetting() = runTest {
-        setting.value = null
+    fun syncingOnReturnRightAfterStartingWaitsForTheSettings() = runTest {
+        settings.value = null
         val sync = start(home)
-        clipboard.content = "hello"
-        val result = async { sync.syncClipboard() }
+        clipboard.copy("hello")
+        val returned = async { sync.syncOnReturn() }
         runCurrent()
-        assertFalse(result.isCompleted)
+        assertFalse(returned.isCompleted)
 
-        setting.value = true
-        assertEquals(SyncResult.NoDesktopOnline, result.await())
+        settings.value = ClipboardSettings(autoSend = false)
+        returned.await()
+        assertEquals(0, clipboard.reads)
     }
 
     @Test

@@ -72,7 +72,7 @@ sealed interface ConnectionNotice {
     data class PairingRevoked(val desktopName: String) : ConnectionNotice
 
     /** 电脑端让这部手机切换到了它。 */
-    data class SwitchedByDesktop(val desktopName: String) : ConnectionNotice
+    data class Switched(val desktopName: String) : ConnectionNotice
 }
 
 /**
@@ -83,8 +83,8 @@ sealed interface ConnectionNotice {
  *
  * 配对、取消配对、切换以及各条连接报告的结果，都排队按顺序处理，状态不会被并发改乱。
  *
- * 剪贴板同步不只是当前电脑（docs/prd/clipboard-sync.md）：每条连接在验证配对后先发出 [greeting] 给出的消息，
- * 任何一台电脑端发来的剪贴板都交给 [clipboardTexts]。
+ * 剪贴板同步不只是当前电脑（docs/prd/clipboard-sync.md）：任何一台电脑端发来的剪贴板都交给 [clipboardTexts]，
+ * [sendToAll] 发给所有在线的电脑端。
  */
 class DesktopConnection(
     private val store: PairedDesktopStore,
@@ -94,8 +94,6 @@ class DesktopConnection(
     private val finder: DesktopFinder,
     /** 手机的网络变了、屏幕亮了时发出：还没连上的电脑立即重连（ADR-0004）。 */
     private val wakeUps: Flow<Unit>,
-    /** 每条连接验证配对后先发出的消息，在连接建立的那一刻取。 */
-    private val greeting: () -> List<ClientMessage>,
 ) {
     private val paired = MutableStateFlow<List<PairedDesktop>>(emptyList())
     private val _activeId = MutableStateFlow<String?>(null)
@@ -179,7 +177,7 @@ class DesktopConnection(
     }
 
     fun switchTo(id: String) {
-        commands.trySend(Command.Switch(id, byDesktop = false))
+        commands.trySend(Command.Switch(id, announce = false))
     }
 
     /** 发给当前电脑。未连接时直接丢弃并返回 false：断线期间的操作不在重连后补发。 */
@@ -241,7 +239,14 @@ class DesktopConnection(
                     links.remove(old.id)?.cancelAndJoin()
                     startLink(old.id, Target.Paired(old))
                 }
-                if (command.byDesktop) _notices.emit(ConnectionNotice.SwitchedByDesktop(desktop.name))
+                if (command.announce) _notices.emit(ConnectionNotice.Switched(desktop.name))
+            }
+            // 当前电脑连不上、而另一台在线：多半是到了另一个地方，自动切过去（docs/prd/pairing.md）。
+            // 还在连的不算连不上，手机刚打开时哪台先连上都不会抢走当前电脑。
+            is Command.Unreachable -> {
+                if (_activeId.value != command.id) return
+                val other = paired.value.firstOrNull { it.id in online.value } ?: return
+                handle(Command.Switch(other.id, announce = true))
             }
         }
     }
@@ -293,6 +298,7 @@ class DesktopConnection(
                 }
                 log.i { "$id connection ended: $end" }
                 online.update { it - id }
+                if (!welcomed && end == SessionEnd.Dropped) commands.send(Command.Unreachable(id))
                 if (welcomed) {
                     // 每次断线后重新开始查找：系统会把当前的地址重新报一遍，包括新出现的网络（例如刚打开的手机热点）。
                     lookup = lookUp()
@@ -388,7 +394,6 @@ class DesktopConnection(
 
             coroutineScope {
                 val queue = Channel<ByteArray>(Channel.UNLIMITED)
-                greeting().forEach { queue.trySend(it.encode()) }
                 // 先能发消息、再算在线：看到在线就能发出去。
                 outgoing.update { it + (id to queue) }
                 online.update { it + (id to ConnectionState.Connected(desktop.name, welcome.operating_system)) }
@@ -410,7 +415,7 @@ class DesktopConnection(
         while (true) {
             val message = ServerMessage.ADAPTER.decode(session.receive())
             when {
-                message.switch_request != null -> commands.send(Command.Switch(id, byDesktop = true))
+                message.switch_request != null -> commands.send(Command.Switch(id, announce = true))
                 message.clipboard_text != null -> _clipboardTexts.emit(DesktopClipboard(id, message.clipboard_text))
                 _activeId.value == id -> _messages.emit(message)
             }
@@ -455,7 +460,11 @@ class DesktopConnection(
     private sealed interface Command {
         class Pair(val link: PairingLink) : Command
         class Unpair(val id: String) : Command
-        class Switch(val id: String, val byDesktop: Boolean) : Command
+        /** [announce] 为 true 时提示切到了哪台：切换不是用户在手机上点的（电脑端要求，或者自动切换）。 */
+        class Switch(val id: String, val announce: Boolean) : Command
+
+        /** 这台电脑端这次没连上。 */
+        class Unreachable(val id: String) : Command
 
         /** 一条连接连上了；[paired] 表示这是扫码配对成功。 */
         class Welcomed(val desktop: PairedDesktop, val paired: Boolean) : Command

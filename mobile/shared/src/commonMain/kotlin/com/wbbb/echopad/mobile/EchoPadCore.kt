@@ -7,7 +7,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.stateIn
 import kotlin.time.Clock
@@ -21,9 +20,6 @@ class EchoPadCore(val platform: Platform) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     val storage = platform.storage
 
-    /** 剪贴板同步的开关，还没读出来时为 null。 */
-    private val clipboardSetting: StateFlow<Boolean?> = storage.clipboardSync.stateIn(scope, SharingStarted.Eagerly, null)
-
     val connection = DesktopConnection(
         storage.pairedDesktops,
         platform.deviceName,
@@ -31,11 +27,11 @@ class EchoPadCore(val platform: Platform) {
         scope,
         platform.desktopFinder,
         merge(platform.networkChanges, platform.screenTurnedOn),
-        greeting = { ClipboardSync.greeting(enabled = platform.clipboard != null && clipboardSetting.value == true) },
     )
 
     /** 平台不支持剪贴板时（iOS 版还没有）为 null。 */
     val clipboardSync = platform.clipboard?.let {
-        ClipboardSync(connection, clipboardSetting, it, scope, now = { Clock.System.now().toEpochMilliseconds() })
+        val settings = storage.clipboardSettings.stateIn(scope, SharingStarted.Eagerly, null)
+        ClipboardSync(connection, settings, it, scope, now = { Clock.System.now().toEpochMilliseconds() })
     }
 }

@@ -24,6 +24,7 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tracing_subscriber::EnvFilter;
 
@@ -54,14 +55,14 @@ struct AppState {
 }
 
 impl AppState {
-    /// 按当前设置重建语音输入服务，并打开或关闭剪贴板同步。
+    /// 按当前设置重建语音输入服务，并更新剪贴板同步的开关。
     fn apply_settings(&self) {
         let settings = self.settings.get();
         let service = settings
             .dictation_config()
             .map(|config| Arc::new(CloudDictation::new(config)) as Arc<dyn DictationService>);
         self.server.set_dictation(service);
-        self.server.set_clipboard_enabled(settings.clipboard.enabled);
+        self.server.set_clipboard(&settings.clipboard);
     }
 
     fn save_settings(&self, settings: Settings) -> Result<SettingsView, String> {
@@ -136,6 +137,12 @@ fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Resul
     state.save_settings(settings)
 }
 
+/// 主窗口里的"同步剪贴板"：把电脑剪贴板上的文字发给所有在线的手机端，返回给用户的提示。
+#[tauri::command]
+fn sync_clipboard(state: tauri::State<'_, AppState>) -> String {
+    state.server.sync_clipboard().message()
+}
+
 /// 取消一部手机端的配对，它之后要重新扫码配对。
 #[tauri::command]
 fn unpair_phone(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
@@ -199,8 +206,10 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        .menu(app_menu)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             build_tray(app)?;
 
@@ -253,6 +262,7 @@ pub fn run() {
             get_settings,
             save_settings,
             unpair_phone,
+            sync_clipboard,
             open_privacy_settings,
             get_update_status,
             check_for_updates,
@@ -265,6 +275,79 @@ pub fn run() {
             RunEvent::Ready | RunEvent::Reopen { .. } => show_main_window(app),
             _ => {}
         });
+}
+
+/// macOS 的应用菜单：各项照 Tauri 的默认菜单摆，只把文字写死成中文，用词和 DevCube 一致（ADR-0020）。
+/// 窗口和帮助两块用 Tauri 约定的标识，Tauri 据此把它们登记成系统的窗口菜单和帮助菜单，macOS 才往里加窗口列表、
+/// 平铺和帮助搜索；macOS 自己加的这些项靠 Info.plist 把默认语言设成简体中文。
+#[cfg(target_os = "macos")]
+fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    use tauri::menu::{AboutMetadata, HELP_SUBMENU_ID, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID};
+
+    let package = app.package_info();
+    let name = &package.name;
+    let about = AboutMetadata {
+        name: Some(name.clone()),
+        version: Some(package.version.to_string()),
+        copyright: app.config().bundle.copyright.clone(),
+        authors: app.config().bundle.publisher.clone().map(|publisher| vec![publisher]),
+        ..Default::default()
+    };
+    Menu::with_items(
+        app,
+        &[
+            &Submenu::with_items(
+                app,
+                name,
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, Some(&format!("关于 {name}")), Some(about))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, Some("服务"))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, Some(&format!("隐藏 {name}")))?,
+                    &PredefinedMenuItem::hide_others(app, Some("隐藏其他"))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, Some(&format!("退出 {name}")))?,
+                ],
+            )?,
+            &Submenu::with_items(app, "文件", true, &[&PredefinedMenuItem::close_window(app, Some("关闭窗口"))?])?,
+            &Submenu::with_items(
+                app,
+                "编辑",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, Some("撤销"))?,
+                    &PredefinedMenuItem::redo(app, Some("重做"))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, Some("剪切"))?,
+                    &PredefinedMenuItem::copy(app, Some("复制"))?,
+                    &PredefinedMenuItem::paste(app, Some("粘贴"))?,
+                    &PredefinedMenuItem::select_all(app, Some("全选"))?,
+                ],
+            )?,
+            &Submenu::with_items(app, "视图", true, &[&PredefinedMenuItem::fullscreen(app, Some("切换全屏"))?])?,
+            &Submenu::with_id_and_items(
+                app,
+                WINDOW_SUBMENU_ID,
+                "窗口",
+                true,
+                &[
+                    &PredefinedMenuItem::minimize(app, Some("最小化"))?,
+                    &PredefinedMenuItem::maximize(app, Some("缩放"))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::close_window(app, Some("关闭窗口"))?,
+                ],
+            )?,
+            &Submenu::with_id_and_items(app, HELP_SUBMENU_ID, "帮助", true, &[])?,
+        ],
+    )
+}
+
+/// Windows 版再做。
+#[cfg(not(target_os = "macos"))]
+fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    Menu::default(app)
 }
 
 /// 菜单栏图标：左键点击打开窗口；右键点击是菜单，可以重新打开窗口、让在线的手机端切换过来、退出电脑端。
@@ -282,6 +365,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            // 点菜单时主窗口通常没开，结果用系统通知提示（DESIGN.md）。
+            "sync_clipboard" => {
+                let message = app.state::<AppState>().server.sync_clipboard().message();
+                if let Err(err) = app.notification().builder().body(message).show() {
+                    tracing::warn!("failed to show a notification: {err}");
+                }
+            }
             "quit" => {
                 app.state::<Arc<Updater>>().install_on_quit();
                 app.exit(0);
@@ -296,13 +386,17 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 右键菜单：每部在线的手机端一项"让它控制这台电脑"。
+/// 右键菜单：每部在线的手机端一项"让它控制这台电脑"；有手机在线时还有"同步剪贴板"。
 fn tray_menu(app: &AppHandle, phones: &[PhoneStatus]) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(app, "open", "打开 EchoPad", true, None::<&str>)?)?;
-    for phone in phones.iter().filter(|phone| phone.online) {
+    let online: Vec<_> = phones.iter().filter(|phone| phone.online).collect();
+    for phone in &online {
         let id = format!("{SWITCH_MENU_PREFIX}{}", phone.id);
         menu.append(&MenuItem::with_id(app, id, format!("让 {} 控制这台电脑", phone.name), true, None::<&str>)?)?;
+    }
+    if !online.is_empty() {
+        menu.append(&MenuItem::with_id(app, "sync_clipboard", "同步剪贴板", true, None::<&str>)?)?;
     }
     menu.append(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)?;
     Ok(menu)
@@ -393,7 +487,7 @@ fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerCo
     ));
     let (enabled, copied) = (server.clone(), server.clone());
     clipboard.watch(
-        move || enabled.clipboard_enabled(),
+        move || enabled.clipboard_auto_send(),
         move |text| copied.share_clipboard(text),
         move |denied| status.set_clipboard_access_denied(denied),
     );
@@ -407,7 +501,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        clipboard::ClipboardSink,
+        clipboard::Clipboard,
         input::{InputCommand, InputSink},
     };
 
@@ -419,7 +513,11 @@ mod tests {
 
     struct IgnoredClipboard;
 
-    impl ClipboardSink for IgnoredClipboard {
+    impl Clipboard for IgnoredClipboard {
+        fn read(&self) -> Option<String> {
+            None
+        }
+
         fn write(&self, _text: &str) {}
     }
 
@@ -462,14 +560,14 @@ mod tests {
     }
 
     #[test]
-    fn saving_settings_turns_clipboard_sync_on_and_off() {
+    fn saving_settings_turns_clipboard_auto_send_on_and_off() {
         let state = state();
         state.apply_settings();
-        assert!(state.server.clipboard_enabled());
+        assert!(state.server.clipboard_auto_send());
 
         let mut settings = Settings::default();
-        settings.clipboard.enabled = false;
+        settings.clipboard.auto_send = false;
         state.save_settings(settings).unwrap();
-        assert!(!state.server.clipboard_enabled());
+        assert!(!state.server.clipboard_auto_send());
     }
 }

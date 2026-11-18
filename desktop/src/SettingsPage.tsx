@@ -16,7 +16,7 @@ type Settings = {
   recognition: { service: string; doubaoResource: string };
   cleanup: { enabled: boolean; preset: string; baseUrl: string; model: string };
   keys: Partial<Record<Credential, string>>;
-  clipboard: { enabled: boolean };
+  clipboard: { autoSend: boolean; receive: boolean };
 };
 
 type Choice = { id: string; name: string; credential: Credential | null };
@@ -193,14 +193,21 @@ export function SettingsPage({
         <Card>
           <CardHeader>
             <CardTitle>剪贴板同步</CardTitle>
-            <CardAction>
-              <Switch
-                checked={settings.clipboard.enabled}
-                onCheckedChange={(enabled) => update((draft) => (draft.clipboard.enabled = enabled))}
-                aria-label="剪贴板同步"
-              />
-            </CardAction>
           </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            <SwitchRow
+              id="clipboard-auto-send"
+              label="自动发送剪贴板"
+              checked={settings.clipboard.autoSend}
+              onCheckedChange={(autoSend) => update((draft) => (draft.clipboard.autoSend = autoSend))}
+            />
+            <SwitchRow
+              id="clipboard-receive"
+              label="接收剪贴板"
+              checked={settings.clipboard.receive}
+              onCheckedChange={(receive) => update((draft) => (draft.clipboard.receive = receive))}
+            />
+          </CardContent>
         </Card>
 
         <AboutCard status={updateStatus} onUpdate={onUpdate} />
@@ -239,6 +246,26 @@ function AboutCard({ status, onUpdate }: { status: UpdateStatus; onUpdate: () =>
         {status.phase === "failed" && <p className="text-sm text-destructive">更新失败，请重试</p>}
       </CardContent>
     </Card>
+  );
+}
+
+/** 一行开关：左边是名称，右边是开关。 */
+function SwitchRow({
+  id,
+  label,
+  checked,
+  onCheckedChange,
+}: {
+  id: string;
+  label: string;
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <Label htmlFor={id}>{label}</Label>
+      <Switch id={id} checked={checked} onCheckedChange={onCheckedChange} />
+    </div>
   );
 }
 

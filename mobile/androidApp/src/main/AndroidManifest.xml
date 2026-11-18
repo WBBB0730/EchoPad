@@ -51,6 +51,10 @@
                     android:host="pair"
                     android:scheme="echopad" />
             </intent-filter>
+            <!-- 长按下拉菜单里的磁贴打开 EchoPad，不打开应用信息。 -->
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
         </activity>
 
         <!-- 后台连接（ADR-0019）。 -->

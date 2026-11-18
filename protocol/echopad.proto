@@ -29,8 +29,7 @@ message ClientMessage {
     Zoom zoom = 11;
     DictationCancel dictation_cancel = 12;
     CharacterPress character_press = 13;
-    ClipboardSyncSetting clipboard_sync_setting = 14;
-    ClipboardText clipboard_text = 15;
+    ClipboardText clipboard_text = 14;
   }
 }
 
@@ -184,14 +183,9 @@ message ShortcutAction {
   Shortcut shortcut = 1;
 }
 
-// 手机端是否开着剪贴板同步（docs/prd/clipboard-sync.md）。开着时在验证配对后的第一条消息里发送，
-// 之后开关变化时再发；电脑端只把剪贴板发给开着同步的手机端，没收到过时当作关着。
-message ClipboardSyncSetting {
-  bool enabled = 1;
-}
-
-// 剪贴板上的文字和它最后更新的时间，两个方向通用（ADR-0018）。有人复制时推送，连上时不互报。
-// 收到的设备只在它比自己的新时才用（先比更新时间，相同再比文字），用了就转给自己连着的其他设备。
+// 剪贴板上的文字和它最后更新的时间，两个方向通用（docs/prd/clipboard-sync.md、ADR-0018）。有人复制时推送，连上时不互报。
+// 收到的设备只在它比自己的新时才用（先比更新时间，相同再比文字），用了就转给自己连着的其他设备；
+// 写不写进自己的剪贴板由它自己的"接收"开关决定，转发不受影响。
 // 文字按 UTF-8 计不超过 1 MB，更长的不同步。
 message ClipboardText {
   string text = 1;

@@ -33,7 +33,7 @@ fun App(core: EchoPadCore, pairingLinks: Flow<String> = emptyFlow()) {
     val state by viewModel.connection.state.collectAsStateWithLifecycle()
     val touchpadSettings by viewModel.touchpadSettings.collectAsStateWithLifecycle()
     val update = viewModel.updater?.state?.collectAsStateWithLifecycle()?.value
-    val clipboardSync = viewModel.clipboardSync?.enabled?.collectAsStateWithLifecycle()?.value
+    val clipboardSettings = viewModel.clipboardSettings?.collectAsStateWithLifecycle()?.value
     val snackbar = remember { SnackbarHostState() }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
@@ -64,8 +64,9 @@ fun App(core: EchoPadCore, pairingLinks: Flow<String> = emptyFlow()) {
                         keyboard = viewModel.keyboard,
                         settings = touchpadSettings,
                         onSettingsChange = viewModel::setTouchpadSettings,
-                        clipboardSync = clipboardSync,
-                        onClipboardSyncChange = viewModel::setClipboardSync,
+                        clipboardSettings = clipboardSettings,
+                        onClipboardSettingsChange = viewModel::setClipboardSettings,
+                        onSyncClipboard = viewModel::syncClipboard.takeIf { viewModel.canSyncClipboard },
                         onScanned = viewModel::onPairingLink,
                         onNotice = viewModel::notify,
                         update = update,

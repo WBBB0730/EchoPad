@@ -1,7 +1,8 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ChevronLeftIcon, PlusIcon, SettingsIcon, SmartphoneIcon } from "lucide-react";
+import { toast } from "sonner";
+import { ChevronLeftIcon, ClipboardPasteIcon, PlusIcon, SettingsIcon, SmartphoneIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { SettingsPage } from "./SettingsPage";
@@ -107,10 +108,18 @@ function App() {
                 </li>
               ))}
             </ul>
-            <Button variant="ghost" size="sm" className="mt-2 self-start text-muted-foreground" onClick={() => setPage("pairing")}>
-              <PlusIcon />
-              配对新手机
-            </Button>
+            <div className="mt-2 flex gap-2 self-start">
+              <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setPage("pairing")}>
+                <PlusIcon />
+                配对新手机
+              </Button>
+              {online > 0 && (
+                <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => invoke<string>("sync_clipboard").then((message) => toast(message))}>
+                  <ClipboardPasteIcon />
+                  同步剪贴板
+                </Button>
+              )}
+            </div>
           </>
         )}
 

@@ -11,17 +11,17 @@ use crate::protocol::ClipboardText;
 /// 同步的文字按 UTF-8 计不超过这个长度，更长的不同步（echopad.proto）。
 pub const MAX_TEXT_BYTES: usize = 1_000_000;
 
-/// 本机剪贴板上的内容和它最后更新的时间（ADR-0018）。
+/// 剪贴板同步里最新的一条：内容和它最后更新的时间（ADR-0018）。关着接收时，它可能和本机剪贴板上的不一样。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncedClipboard {
-    /// 打开同步或启动以后还没见过内容时为 `None`。
+    /// 启动以后还没见过内容时为 `None`。
     text: Option<String>,
     /// Unix 毫秒。
     updated_at: i64,
 }
 
 impl SyncedClipboard {
-    /// 打开同步或启动的那一刻：内容未知，之前的复制都算旧的。
+    /// 启动的那一刻：内容未知，之前的复制都算旧的。
     pub fn unknown_since(now: i64) -> Self {
         Self { text: None, updated_at: now }
     }
@@ -49,6 +49,29 @@ impl SyncedClipboard {
     }
 }
 
+/// 用户在电脑端主动同步的结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum SyncResult {
+    /// 发给了这几部手机端，按名称列出。
+    Sent(Vec<String>),
+    NoPhoneOnline,
+    NoText,
+    TooLong,
+}
+
+impl SyncResult {
+    /// 给用户的提示，和手机端的写法一致：主窗口里用 Toast，菜单栏菜单用系统通知（DESIGN.md）。
+    pub fn message(&self) -> String {
+        match self {
+            Self::Sent(names) if names.len() == 1 => format!("已同步到 {}", names[0]),
+            Self::Sent(names) => format!("已同步到 {} 部手机", names.len()),
+            Self::NoPhoneOnline => "没有在线的手机".into(),
+            Self::NoText => "剪贴板里没有文字".into(),
+            Self::TooLong => "文字太长，没有同步".into(),
+        }
+    }
+}
+
 /// 现在的 Unix 毫秒。
 pub fn now_millis() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as i64)
@@ -57,8 +80,11 @@ pub fn now_millis() -> i64 {
 /// 多久看一次剪贴板有没有变化。
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 写入电脑的剪贴板。
-pub trait ClipboardSink: Send + Sync {
+/// 电脑的剪贴板。
+pub trait Clipboard: Send + Sync {
+    /// 剪贴板上的文字，没有文字时为 `None`。用户主动同步时读取。
+    fn read(&self) -> Option<String>;
+
     /// 写入手机端同步来的文字。这次写入不算用户复制的内容，监听时不会再报告出来。
     fn write(&self, text: &str);
 }
@@ -67,8 +93,8 @@ pub use platform::SystemClipboard;
 
 impl SystemClipboard {
     /// 在单独的线程里每 0.5 秒看一次剪贴板的变化计数，变了才读取（ADR-0017），启动前就在剪贴板上的内容不报告。
-    /// `enabled` 为 false（电脑端关着同步）时不读剪贴板；用户复制了文字时调用 `on_copy`；
-    /// `on_access_denied` 报告开着同步时系统是否一律拒绝 EchoPad 读剪贴板，只在变化时调用。
+    /// `enabled` 为 false（关着自动发送）时不读剪贴板；用户复制了文字时调用 `on_copy`；
+    /// `on_access_denied` 报告开着自动发送时系统是否一律拒绝 EchoPad 读剪贴板，只在变化时调用。
     pub fn watch(
         self: Arc<Self>,
         enabled: impl Fn() -> bool + Send + 'static,
@@ -104,7 +130,7 @@ mod platform {
     use objc2_app_kit::{NSPasteboard, NSPasteboardAccessBehavior, NSPasteboardTypeString};
     use objc2_foundation::{NSInteger, NSString, ns_string};
 
-    use super::ClipboardSink;
+    use super::Clipboard;
 
     pub struct SystemClipboard {
         /// 最近一次处理过的变化计数：看过的，或者自己写入后的。看计数和写入都持有这把锁，
@@ -155,7 +181,14 @@ mod platform {
             .any(|skipped| types.containsObject(skipped))
     }
 
-    impl ClipboardSink for SystemClipboard {
+    impl Clipboard for SystemClipboard {
+        fn read(&self) -> Option<String> {
+            autoreleasepool(|_| {
+                let text = NSPasteboard::generalPasteboard().stringForType(unsafe { NSPasteboardTypeString })?;
+                Some(text.to_string()).filter(|text| !text.is_empty())
+            })
+        }
+
         fn write(&self, text: &str) {
             autoreleasepool(|_| {
                 let pasteboard = NSPasteboard::generalPasteboard();
@@ -209,7 +242,7 @@ mod tests {
 /// Windows 版再做。
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::ClipboardSink;
+    use super::Clipboard;
 
     pub struct SystemClipboard;
 
@@ -227,7 +260,11 @@ mod platform {
         }
     }
 
-    impl ClipboardSink for SystemClipboard {
+    impl Clipboard for SystemClipboard {
+        fn read(&self) -> Option<String> {
+            None
+        }
+
         fn write(&self, _text: &str) {}
     }
 }

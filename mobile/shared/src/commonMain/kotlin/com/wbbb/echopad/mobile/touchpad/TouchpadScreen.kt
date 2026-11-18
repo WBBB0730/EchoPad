@@ -32,8 +32,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -43,6 +45,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TooltipAnchorPosition
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -74,6 +80,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.wbbb.echopad.mobile.clipboard.ClipboardSettings
 import com.wbbb.echopad.mobile.connection.ConnectionState
 import com.wbbb.echopad.mobile.connection.DesktopConnection
 import com.wbbb.echopad.mobile.connection.DesktopEntry
@@ -95,6 +102,7 @@ import com.wbbb.echopad.mobile.update.AboutRow
 import com.wbbb.echopad.mobile.update.UpdateSheet
 import com.wbbb.echopad.mobile.update.UpdateState
 import echopad.shared.generated.resources.Res
+import echopad.shared.generated.resources.content_paste_go
 import echopad.shared.generated.resources.keyboard
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Job
@@ -117,9 +125,11 @@ fun TouchpadScreen(
     keyboard: KeyboardInput,
     settings: TouchpadSettings,
     onSettingsChange: (TouchpadSettings) -> Unit,
-    /** 剪贴板同步是否开着；平台不支持时为 null。 */
-    clipboardSync: Boolean?,
-    onClipboardSyncChange: (Boolean) -> Unit,
+    /** 剪贴板同步设置；平台不支持时为 null。 */
+    clipboardSettings: ClipboardSettings?,
+    onClipboardSettingsChange: (ClipboardSettings) -> Unit,
+    /** EchoPad 里的"同步剪贴板"；平台不支持时为 null。 */
+    onSyncClipboard: (() -> Unit)?,
     onScanned: (String) -> Unit,
     onNotice: (String) -> Unit,
     /** 应用内更新的状态；平台不支持时为 null。 */
@@ -161,6 +171,10 @@ fun TouchpadScreen(
     val connectionLabel = @Composable { modifier: Modifier ->
         // 点电脑名打开电脑列表，在那里切换、取消配对或添加电脑。
         ConnectionLabel(state, activeName, modifier.clickable { desktopsOpen = true })
+    }
+    val syncClipboardButton = @Composable {
+        // 有电脑在线时才显示：没有电脑在线时同步不出去（DESIGN.md）。
+        if (onSyncClipboard != null && desktops.any { it.online }) SyncClipboardButton(onSyncClipboard)
     }
     val settingsButton = @Composable {
         TextButton(onClick = { settingsOpen = true }) {
@@ -231,6 +245,7 @@ fun TouchpadScreen(
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             connectionLabel(Modifier.weight(1f).padding(start = 12.dp))
+                            syncClipboardButton()
                             settingsButton()
                         }
                         switchableKeys(3, 2)
@@ -253,6 +268,7 @@ fun TouchpadScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     connectionLabel(Modifier.weight(1f))
+                    syncClipboardButton()
                     settingsButton()
                 }
                 // 右侧的系统手势区域只留给滚动条：竖着滑归滚动条，横着滑仍是系统的返回（docs/prd/touchpad.md）。
@@ -289,8 +305,8 @@ fun TouchpadScreen(
         SettingsSheet(
             settings = settings,
             onSettingsChange = onSettingsChange,
-            clipboardSync = clipboardSync,
-            onClipboardSyncChange = onClipboardSyncChange,
+            clipboardSettings = clipboardSettings,
+            onClipboardSettingsChange = onClipboardSettingsChange,
             update = update,
             onCheckForUpdates = onCheckForUpdates,
             onUpdate = {
@@ -662,7 +678,7 @@ private fun TalkButton(
 }
 
 /**
- * 设置：指针速度和滚动速度（松手时保存）、双指滚动和单指滚动的方向（选择时保存）、剪贴板同步的开关，
+ * 设置：指针速度和滚动速度（松手时保存）、双指滚动和单指滚动的方向（选择时保存）、剪贴板同步的两个开关，
  * 最下面是版本号与检查更新。
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -670,8 +686,8 @@ private fun TalkButton(
 private fun SettingsSheet(
     settings: TouchpadSettings,
     onSettingsChange: (TouchpadSettings) -> Unit,
-    clipboardSync: Boolean?,
-    onClipboardSyncChange: (Boolean) -> Unit,
+    clipboardSettings: ClipboardSettings?,
+    onClipboardSettingsChange: (ClipboardSettings) -> Unit,
     update: UpdateState?,
     onCheckForUpdates: (force: Boolean) -> Unit,
     onUpdate: () -> Unit,
@@ -702,7 +718,14 @@ private fun SettingsSheet(
                 stripScroll = it
                 save()
             }
-            if (clipboardSync != null) ClipboardSyncRow(clipboardSync, onClipboardSyncChange)
+            if (clipboardSettings != null) {
+                SwitchRow("自动发送剪贴板", clipboardSettings.autoSend) {
+                    onClipboardSettingsChange(clipboardSettings.copy(autoSend = it))
+                }
+                SwitchRow("接收剪贴板", clipboardSettings.receive) {
+                    onClipboardSettingsChange(clipboardSettings.copy(receive = it))
+                }
+            }
             if (update != null) AboutRow(update, onCheck = { onCheckForUpdates(true) }, onUpdate = onUpdate)
         }
     }
@@ -735,13 +758,28 @@ private fun ScrollDirectionChoice(label: String, value: ScrollDirection, onValue
     }
 }
 
-/** 一行剪贴板同步：左边是名称，右边是开关。 */
+/** 顶部的"同步剪贴板"：把手机剪贴板上的文字发给所有在线的电脑；图标没有文字，长按显示名称。 */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ClipboardSyncRow(enabled: Boolean, onEnabledChange: (Boolean) -> Unit) {
-    SettingRow("剪贴板同步") {
+private fun SyncClipboardButton(onClick: () -> Unit) {
+    TooltipBox(
+        positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
+        tooltip = { PlainTooltip { Text("同步剪贴板") } },
+        state = rememberTooltipState(),
+    ) {
+        IconButton(onClick = onClick) {
+            Icon(painterResource(Res.drawable.content_paste_go), contentDescription = "同步剪贴板", tint = EchoPadColors.TextMuted)
+        }
+    }
+}
+
+/** 一行开关：左边是名称，右边是开关。 */
+@Composable
+private fun SwitchRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    SettingRow(label) {
         Switch(
-            checked = enabled,
-            onCheckedChange = onEnabledChange,
+            checked = checked,
+            onCheckedChange = onCheckedChange,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = EchoPadColors.Background,
                 checkedTrackColor = EchoPadColors.Text,

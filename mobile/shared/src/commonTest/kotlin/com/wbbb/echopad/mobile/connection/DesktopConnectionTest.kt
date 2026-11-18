@@ -5,7 +5,6 @@ import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.pairing.SavedPairing
 import com.wbbb.echopad.mobile.protocol.ClientMessage
-import com.wbbb.echopad.mobile.protocol.ClipboardSyncSetting
 import com.wbbb.echopad.mobile.protocol.ClipboardText
 import com.wbbb.echopad.mobile.protocol.OperatingSystem
 import com.wbbb.echopad.mobile.protocol.PointerMove
@@ -37,8 +36,6 @@ class DesktopConnectionTest {
     private val transport = FakeTransport()
     private val finder = FakeFinder()
     private val networkChanges = MutableSharedFlow<Unit>()
-    /** 每条连接验证配对后先发出的消息。 */
-    private var greeting = emptyList<ClientMessage>()
     private val move = ClientMessage(pointer_move = PointerMove(dx = 1f, dy = 2f))
 
     @Test
@@ -141,7 +138,7 @@ class DesktopConnectionTest {
         runCurrent()
 
         assertEquals(office.id, connection.activeId.value)
-        assertEquals(listOf<ConnectionNotice>(ConnectionNotice.SwitchedByDesktop("Office")), notices)
+        assertEquals(listOf<ConnectionNotice>(ConnectionNotice.Switched("Office")), notices)
     }
 
     @Test
@@ -391,6 +388,43 @@ class DesktopConnectionTest {
     }
 
     @Test
+    fun anUnreachableActiveDesktopHandsOverToAnOnlineOne() = runTest {
+        val store = MemoryStore(home, office)
+        val connection = connect(store)
+        val notices = collectNotices(connection)
+        val homeSession = transport.sessions.receive()
+        welcome(transport.sessions.receive(), "Office")
+
+        // 家里那台连不上：到了公司。
+        homeSession.drop()
+        runCurrent()
+        assertEquals(office.id, connection.activeId.value)
+        assertEquals(office.id, store.activeId)
+        assertEquals(listOf<ConnectionNotice>(ConnectionNotice.Switched("Office")), notices)
+    }
+
+    @Test
+    fun anActiveDesktopStillConnectingIsNotReplaced() = runTest {
+        val connection = connect(MemoryStore(home, office))
+        // 手机刚打开，家里那台还在连，公司那台先连上了。
+        transport.sessions.receive()
+        welcome(transport.sessions.receive(), "Office")
+        assertEquals(home.id, connection.activeId.value)
+    }
+
+    @Test
+    fun anActiveDesktopDroppingAfterBeingOnlineIsNotReplacedRightAway() = runTest {
+        val connection = connect(MemoryStore(home, office))
+        val homeSession = welcome(transport.sessions.receive(), "Mac")
+        welcome(transport.sessions.receive(), "Office")
+
+        // 断线后先重连，重连也连不上才算连不上。
+        homeSession.drop()
+        runCurrent()
+        assertEquals(home.id, connection.activeId.value)
+    }
+
+    @Test
     fun itTellsWhetherAnyDesktopIsPairedOnceTheSavedPairingIsRead() = runTest {
         val loaded = CompletableDeferred<Unit>()
         val memory = MemoryStore()
@@ -412,16 +446,6 @@ class DesktopConnectionTest {
         session.reply(ServerMessage(welcome = Welcome(desktop_name = "Office Mac", device_key = "new-key", desktop_id = "desk-9")))
         runCurrent()
         assertEquals(true, connection.hasDesktops.value)
-    }
-
-    @Test
-    fun everyConnectionStartsWithTheGreeting() = runTest {
-        val setting = ClientMessage(clipboard_sync_setting = ClipboardSyncSetting(enabled = true))
-        greeting = listOf(setting)
-        val connection = connect(MemoryStore(home))
-        val session = welcome(transport.sessions.receive(), "Mac")
-        assertTrue(connection.desktops.value.single().online)
-        assertEquals(setting, ClientMessage.ADAPTER.decode(session.sent.receive()))
     }
 
     @Test
@@ -448,7 +472,7 @@ class DesktopConnectionTest {
     }
 
     private fun TestScope.connect(store: PairedDesktopStore) =
-        DesktopConnection(store, "Phone", transport, backgroundScope, finder, networkChanges, greeting = { greeting })
+        DesktopConnection(store, "Phone", transport, backgroundScope, finder, networkChanges)
 
     /** 电脑端验证通过，回复欢迎。 */
     private suspend fun TestScope.welcome(session: FakeSession, name: String): FakeSession {
