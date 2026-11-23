@@ -1,11 +1,17 @@
 package com.wbbb.echopad.mobile.clipboard
 
+import com.wbbb.echopad.mobile.SyncResult
 import com.wbbb.echopad.mobile.connection.DesktopConnection
 import com.wbbb.echopad.mobile.connection.FakeFinder
 import com.wbbb.echopad.mobile.connection.FakeSession
 import com.wbbb.echopad.mobile.connection.FakeTransport
 import com.wbbb.echopad.mobile.connection.MemoryStore
 import com.wbbb.echopad.mobile.connection.pairedDesktop
+import com.wbbb.echopad.mobile.files.FakeFileClient
+import com.wbbb.echopad.mobile.files.FileTransfers
+import com.wbbb.echopad.mobile.files.OutgoingFile
+import com.wbbb.echopad.mobile.files.closed
+import com.wbbb.echopad.mobile.files.outgoingFile
 import com.wbbb.echopad.mobile.pairing.PairedDesktop
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.ClipboardText
@@ -21,6 +27,8 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ClipboardSyncTest {
@@ -29,6 +37,7 @@ class ClipboardSyncTest {
     private val transport = FakeTransport()
     private val settings = MutableStateFlow<ClipboardSettings?>(ClipboardSettings())
     private val clipboard = FakeClipboard()
+    private val fileClient = FakeFileClient()
 
     /** 手机的时钟，Unix 毫秒。 */
     private var clock = 10_000L
@@ -36,6 +45,9 @@ class ClipboardSyncTest {
     private class FakeClipboard : PhoneClipboard {
         /** 剪贴板上的文字。 */
         var content: String? = null
+
+        /** 剪贴板上复制的文件，比文字优先。 */
+        var files: List<OutgoingFile>? = null
 
         /** 回到 EchoPad 时，剪贴板上有没有 EchoPad 还没看过的新内容。 */
         var hasNewContent = false
@@ -45,9 +57,9 @@ class ClipboardSyncTest {
 
         val written = mutableListOf<String>()
 
-        override fun read(): String? {
+        override fun read(): PhoneClipboardContent? {
             reads++
-            return content
+            return files?.let(PhoneClipboardContent::Files) ?: content?.let(PhoneClipboardContent::Text)
         }
 
         override fun readIfNew(): String? {
@@ -76,7 +88,8 @@ class ClipboardSyncTest {
             FakeFinder(),
             MutableSharedFlow(),
         )
-        val sync = ClipboardSync(connection, settings, clipboard, backgroundScope, now = { clock })
+        val files = FileTransfers(connection, fileClient, null, backgroundScope)
+        val sync = ClipboardSync(connection, settings, clipboard, files, backgroundScope, now = { clock })
         runCurrent()
         return sync
     }
@@ -102,6 +115,33 @@ class ClipboardSyncTest {
 
 
     private fun FakeSession.send(clipboard: ClipboardText) = reply(ServerMessage(clipboard_text = clipboard))
+
+    /** 剪贴板上是文字，用不着确认。 */
+    private suspend fun ClipboardSync.syncClipboard() = syncClipboard { error("text needs no confirmation") }
+
+    /** 发给电脑端的文件，按文件名和内容。 */
+    private fun TestScope.uploaded(): List<Pair<String, String>>? {
+        runCurrent()
+        return fileClient.requests.tryReceive().getOrNull()?.files
+    }
+
+    @Test
+    fun copiedFilesAreSentOnlyAfterTheUserConfirms() = runTest {
+        val sync = start(home)
+        welcome("Mac")
+        val declined = outgoingFile("a.txt", "hello")
+        clipboard.files = listOf(declined)
+        val questions = mutableListOf<String>()
+
+        assertNull(sync.syncClipboard { questions += it.question; false })
+        assertTrue(declined.closed)
+        assertNull(uploaded())
+
+        clipboard.files = listOf(outgoingFile("a.txt", "hello"))
+        assertEquals(SyncResult.Sending("Mac"), sync.syncClipboard { true })
+        assertEquals(listOf("a.txt" to "hello"), uploaded())
+        assertEquals(listOf("把 1 个文件（5 字节）发送到 Mac？"), questions)
+    }
 
     @Test
     fun syncingTheClipboardSendsItToEveryOnlineDesktop() = runTest {

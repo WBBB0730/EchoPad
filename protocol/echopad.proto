@@ -30,6 +30,7 @@ message ClientMessage {
     DictationCancel dictation_cancel = 12;
     CharacterPress character_press = 13;
     ClipboardText clipboard_text = 14;
+    FileOfferResult file_offer_result = 15;
   }
 }
 
@@ -202,6 +203,7 @@ message ServerMessage {
     DictationFailed dictation_failed = 6;
     SwitchRequest switch_request = 8;
     ClipboardText clipboard_text = 9;
+    FileOffer file_offer = 10;
   }
   // 曾用于在手机端显示识别中的文字和逐句上屏的文字，已去掉（ADR-0013）。
   reserved 3, 4;
@@ -254,3 +256,35 @@ message DictationFailed {
 
 // 电脑端请手机端切换过来，把这台电脑端设为当前电脑（ADR-0015）。
 message SwitchRequest {}
+
+// 电脑端发文件（docs/prd/send-files.md、ADR-0021）：告诉手机端有哪些文件，手机端再逐个下载。
+// 文件不走这条连接：手机端向电脑端发 `GET /files/{offer_id}/{序号}`，请求头带上 `Authorization: Bearer {设备密钥}`。
+// 每个文件只能下载一次；手机端发回 FileOfferResult 或者断线后，整份清单作废。
+message FileOffer {
+  string offer_id = 1;
+  repeated OfferedFile files = 2;
+}
+
+message OfferedFile {
+  string name = 1;
+  uint64 size = 2;
+}
+
+// 手机端处理完电脑端发来的一份文件清单（docs/prd/send-files.md）：电脑端据此提示结果，这份清单也随之作废。
+message FileOfferResult {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // 全都存好了。
+    OUTCOME_SAVED = 1;
+    // 传到一半出错了，之前存好的保留。
+    OUTCOME_FAILED = 2;
+    // 用户在手机上取消了，之前存好的保留。电脑端不提示。
+    OUTCOME_CANCELLED = 3;
+    // 这部手机不能接收文件（安卓 9 及以下）。
+    OUTCOME_UNSUPPORTED = 4;
+  }
+  string offer_id = 1;
+  Outcome outcome = 2;
+  // 存好了几个文件。
+  uint32 saved = 3;
+}

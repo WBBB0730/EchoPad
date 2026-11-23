@@ -1,6 +1,10 @@
 package com.wbbb.echopad.mobile.clipboard
 
+import com.wbbb.echopad.mobile.SyncResult
 import com.wbbb.echopad.mobile.connection.DesktopConnection
+import com.wbbb.echopad.mobile.files.FileTransfers
+import com.wbbb.echopad.mobile.files.OutgoingFile
+import com.wbbb.echopad.mobile.files.PendingFiles
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.ClipboardText
 import kotlinx.coroutines.CoroutineScope
@@ -11,41 +15,32 @@ import kotlinx.coroutines.launch
 import okio.ByteString.Companion.encodeUtf8
 import okio.utf8Size
 
+/** 手机剪贴板上的内容。 */
+sealed interface PhoneClipboardContent {
+    data class Text(val text: String) : PhoneClipboardContent
+
+    /** 相册等应用"复制"的文件，已经打开（docs/prd/send-files.md）。 */
+    data class Files(val files: List<OutgoingFile>) : PhoneClipboardContent
+
+    /** 复制的文件读不了，例如已经删掉了。 */
+    data object UnreadableFiles : PhoneClipboardContent
+}
+
 /** 手机的系统剪贴板，由各平台实现。 */
 interface PhoneClipboard {
-    /** 剪贴板上的文字；没有文字时为 null。 */
-    fun read(): String?
+    /** 剪贴板上的内容，空的时候为 null。复制的文件优先于文字。 */
+    fun read(): PhoneClipboardContent?
 
-    /** 回到 EchoPad 时调用：剪贴板在 EchoPad 运行期间有了新内容、而且没有标记为敏感时，读出其中的文字，否则返回 null。 */
+    /** 回到 EchoPad 时调用：剪贴板在 EchoPad 运行期间有了新内容、是文字、而且没有标记为敏感时，读出这些文字，否则返回 null。 */
     fun readIfNew(): String?
 
     fun write(text: String)
 }
 
-/** 用户主动同步的结果，在 EchoPad 以外操作时提示用户。 */
-sealed interface SyncResult {
-    /** 发给了这几台电脑端，按名称列出。 */
-    data class Sent(val desktopNames: List<String>) : SyncResult
-
-    data object NoDesktopOnline : SyncResult
-
-    data object NoText : SyncResult
-
-    data object TooLong : SyncResult
-}
-
-/** 同步结果给用户的提示：在 EchoPad 里用 Snackbar，在 EchoPad 以外用 Toast（DESIGN.md）。 */
-val SyncResult.message: String
-    get() = when (this) {
-        is SyncResult.Sent -> desktopNames.singleOrNull()?.let { "已同步到 $it" } ?: "已同步到 ${desktopNames.size} 台电脑"
-        SyncResult.NoDesktopOnline -> "没有在线的电脑"
-        SyncResult.NoText -> "剪贴板里没有文字"
-        SyncResult.TooLong -> "文字太长，没有同步"
-    }
-
 /**
  * 剪贴板同步（docs/prd/clipboard-sync.md、ADR-0018）：手机只记一条剪贴板内容和它的更新时间。
  * 本机复制时发给所有在线的电脑端；收到比自己新的内容才写进手机剪贴板，再转给其他电脑端。
+ * 用户主动同步时遇到的是文件，就交给 [files] 发给当前电脑（docs/prd/send-files.md）。
  *
  * [settings] 是用户在设置里的两个开关（[ClipboardSettings]），还没从本机存储里读出来时为 null。[now] 返回现在的 Unix 毫秒。
  */
@@ -53,6 +48,7 @@ class ClipboardSync(
     private val connection: DesktopConnection,
     private val settings: StateFlow<ClipboardSettings?>,
     private val clipboard: PhoneClipboard,
+    private val files: FileTransfers,
     scope: CoroutineScope,
     private val now: () -> Long,
 ) {
@@ -70,8 +66,17 @@ class ClipboardSync(
         }
     }
 
-    /** 通知上的按钮、磁贴和 EchoPad 里的按钮：读手机剪贴板并发出，算一次新的复制，即使内容和现有的相同也照发。 */
-    fun syncClipboard(): SyncResult = send(clipboard.read() ?: return SyncResult.NoText)
+    /**
+     * 通知上的按钮、磁贴和 EchoPad 里的按钮：读手机剪贴板并发出。文字算一次新的复制，即使内容和现有的相同也照发；
+     * 文件先用 [confirm] 问用户，确认后发给当前电脑。返回要提示的结果，用户不发文件时不提示，为 null。
+     */
+    suspend fun syncClipboard(confirm: suspend (PendingFiles) -> Boolean): SyncResult? =
+        when (val content = clipboard.read()) {
+            null -> SyncResult.NoText
+            is PhoneClipboardContent.Text -> send(content.text)
+            is PhoneClipboardContent.Files -> files.sendToCurrentDesktop(content.files, confirm)
+            PhoneClipboardContent.UnreadableFiles -> SyncResult.FilesUnreadable
+        }
 
     /** 文字选择菜单和分享菜单：选中的文字写进手机剪贴板并发出，效果和在手机上复制一次相同。 */
     fun syncText(text: String): SyncResult {

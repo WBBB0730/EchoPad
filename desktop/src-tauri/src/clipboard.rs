@@ -1,7 +1,8 @@
-//! 电脑的系统剪贴板（docs/prd/clipboard-sync.md、ADR-0017）：发现用户复制的文字，写入手机端同步来的文字；
-//! 以及按更新时间合并剪贴板的规则（ADR-0018）。
+//! 电脑的系统剪贴板（docs/prd/clipboard-sync.md、ADR-0017）：发现用户复制的文字，写入手机端同步来的文字，
+//! 读写发送文件用到的文件和图片（docs/prd/send-files.md）；以及按更新时间合并剪贴板的规则（ADR-0018）。
 
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -52,22 +53,31 @@ impl SyncedClipboard {
 /// 用户在电脑端主动同步的结果。
 #[derive(Debug, PartialEq, Eq)]
 pub enum SyncResult {
-    /// 发给了这几部手机端，按名称列出。
-    Sent(Vec<String>),
-    NoPhoneOnline,
+    /// 文字同步给了这部手机端。
+    TextSent(String),
+    /// 文件清单发给了这部手机端，它接着下载（docs/prd/send-files.md）。
+    FilesSending(String),
+    /// 要发给的手机端不在线。
+    PhoneOffline,
     NoText,
     TooLong,
+    /// 剪贴板里只有文件夹。
+    OnlyFolders,
+    /// 要发送的文件读不了，例如所在的磁盘已经推出。
+    FilesUnreadable,
 }
 
 impl SyncResult {
     /// 给用户的提示，和手机端的写法一致：主窗口里用 Toast，菜单栏菜单用系统通知（DESIGN.md）。
     pub fn message(&self) -> String {
         match self {
-            Self::Sent(names) if names.len() == 1 => format!("已同步到 {}", names[0]),
-            Self::Sent(names) => format!("已同步到 {} 部手机", names.len()),
-            Self::NoPhoneOnline => "没有在线的手机".into(),
+            Self::TextSent(phone) => format!("已发送到 {phone}"),
+            Self::FilesSending(phone) => format!("正在发送到 {phone}"),
+            Self::PhoneOffline => "这部手机不在线".into(),
             Self::NoText => "剪贴板里没有文字".into(),
             Self::TooLong => "文字太长，没有同步".into(),
+            Self::OnlyFolders => "不能发送文件夹".into(),
+            Self::FilesUnreadable => "读不了要发送的文件".into(),
         }
     }
 }
@@ -80,13 +90,28 @@ pub fn now_millis() -> i64 {
 /// 多久看一次剪贴板有没有变化。
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 剪贴板上的内容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardContent {
+    Text(String),
+    /// 在访达里复制的文件，可能有文件夹。
+    Files(Vec<PathBuf>),
+    /// 截图等直接放进剪贴板的图片，转成了 PNG。
+    Image(Vec<u8>),
+}
+
 /// 电脑的剪贴板。
 pub trait Clipboard: Send + Sync {
-    /// 剪贴板上的文字，没有文字时为 `None`。用户主动同步时读取。
-    fn read(&self) -> Option<String>;
+    /// 剪贴板上的内容，用户主动同步时读取。复制的文件优先，其次是文字，最后是图片：访达复制文件时也放了文件名，
+    /// Office 等应用复制文字时也放了图片。
+    fn read(&self) -> Option<ClipboardContent>;
 
     /// 写入手机端同步来的文字。这次写入不算用户复制的内容，监听时不会再报告出来。
     fn write(&self, text: &str);
+
+    /// 放进手机端发来的文件，效果和在访达里复制这些文件一样；只有一张图片时另放一份图片数据，
+    /// 方便粘贴到只认图片的地方（docs/prd/send-files.md）。
+    fn write_files(&self, files: &[PathBuf]);
 }
 
 pub use platform::SystemClipboard;
@@ -124,13 +149,20 @@ impl SystemClipboard {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::sync::Mutex;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
 
-    use objc2::{available, rc::autoreleasepool};
-    use objc2_app_kit::{NSPasteboard, NSPasteboardAccessBehavior, NSPasteboardTypeString};
-    use objc2_foundation::{NSInteger, NSString, ns_string};
+    use objc2::{AllocAnyThread, available, rc::autoreleasepool, runtime::ProtocolObject};
+    use objc2_app_kit::{
+        NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSPasteboard, NSPasteboardAccessBehavior, NSPasteboardItem,
+        NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+    };
+    use objc2_foundation::{NSArray, NSDictionary, NSInteger, NSString, NSURL, ns_string};
+    use objc2_uniform_type_identifiers::{UTType, UTTypeImage};
 
-    use super::Clipboard;
+    use super::{Clipboard, ClipboardContent};
 
     pub struct SystemClipboard {
         /// 最近一次处理过的变化计数：看过的，或者自己写入后的。看计数和写入都持有这把锁，
@@ -145,6 +177,7 @@ mod platform {
         }
 
         /// 剪贴板在上次查看之后有了新内容时，`read` 为 true 就读出其中的文字；为 false 时只记下看过了。
+        /// 复制的是文件时不读：那是要手动发送的文件，不是文字（docs/prd/send-files.md）。
         pub(super) fn copied_text(&self, read: bool) -> Option<String> {
             autoreleasepool(|_| {
                 let pasteboard = NSPasteboard::generalPasteboard();
@@ -154,11 +187,10 @@ mod platform {
                     return None;
                 }
                 *handled = count;
-                if !read || is_skipped(&pasteboard) {
+                if !read || is_skipped(&pasteboard) || !files(&pasteboard).is_empty() {
                     return None;
                 }
-                let text = pasteboard.stringForType(unsafe { NSPasteboardTypeString })?.to_string();
-                Some(text).filter(|text| !text.is_empty())
+                text(&pasteboard)
             })
         }
 
@@ -168,6 +200,19 @@ mod platform {
                 && autoreleasepool(|_| {
                     NSPasteboard::generalPasteboard().accessBehavior() == NSPasteboardAccessBehavior::AlwaysDeny
                 })
+        }
+
+        /// 换掉剪贴板上的内容，`write` 返回是否写成功。这次写入不算用户复制的内容。
+        fn replace(&self, write: impl FnOnce(&NSPasteboard) -> bool) {
+            autoreleasepool(|_| {
+                let pasteboard = NSPasteboard::generalPasteboard();
+                let mut handled = self.handled.lock().unwrap();
+                pasteboard.clearContents();
+                if !write(&pasteboard) {
+                    tracing::warn!("failed to write the clipboard");
+                }
+                *handled = pasteboard.changeCount();
+            });
         }
     }
 
@@ -181,23 +226,86 @@ mod platform {
             .any(|skipped| types.containsObject(skipped))
     }
 
+    /// 复制的文件和文件夹，按复制的顺序。
+    fn files(pasteboard: &NSPasteboard) -> Vec<PathBuf> {
+        let Some(items) = pasteboard.pasteboardItems() else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let url = item.stringForType(unsafe { NSPasteboardTypeFileURL })?;
+                let url = NSURL::URLWithString(&url)?;
+                // 访达放的是文件引用（file:///.file/id=…），换成路径。
+                Some(PathBuf::from(url.filePathURL()?.path()?.to_string()))
+            })
+            .collect()
+    }
+
+    fn text(pasteboard: &NSPasteboard) -> Option<String> {
+        let text = pasteboard.stringForType(unsafe { NSPasteboardTypeString })?.to_string();
+        Some(text).filter(|text| !text.is_empty())
+    }
+
+    /// 剪贴板上的图片，转成 PNG。截图放的是 PNG，有的应用只放 TIFF。
+    fn image(pasteboard: &NSPasteboard) -> Option<Vec<u8>> {
+        if let Some(png) = pasteboard.dataForType(unsafe { NSPasteboardTypePNG }) {
+            return Some(png.to_vec());
+        }
+        let tiff = pasteboard.dataForType(unsafe { NSPasteboardTypeTIFF })?;
+        let bitmap = NSBitmapImageRep::imageRepWithData(&tiff)?;
+        let png = unsafe { bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
+        Some(png.to_vec())
+    }
+
+    /// 按扩展名看文件是不是图片。
+    fn is_image(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| UTType::typeWithFilenameExtension(&NSString::from_str(&extension.to_string_lossy())))
+            .is_some_and(|kind| kind.conformsToType(unsafe { UTTypeImage }))
+    }
+
     impl Clipboard for SystemClipboard {
-        fn read(&self) -> Option<String> {
+        fn read(&self) -> Option<ClipboardContent> {
             autoreleasepool(|_| {
-                let text = NSPasteboard::generalPasteboard().stringForType(unsafe { NSPasteboardTypeString })?;
-                Some(text.to_string()).filter(|text| !text.is_empty())
+                let pasteboard = NSPasteboard::generalPasteboard();
+                let files = files(&pasteboard);
+                if !files.is_empty() {
+                    return Some(ClipboardContent::Files(files));
+                }
+                text(&pasteboard)
+                    .map(ClipboardContent::Text)
+                    .or_else(|| image(&pasteboard).map(ClipboardContent::Image))
             })
         }
 
         fn write(&self, text: &str) {
-            autoreleasepool(|_| {
-                let pasteboard = NSPasteboard::generalPasteboard();
-                let mut handled = self.handled.lock().unwrap();
-                pasteboard.clearContents();
-                if !pasteboard.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }) {
-                    tracing::warn!("failed to write the clipboard");
-                }
-                *handled = pasteboard.changeCount();
+            self.replace(|pasteboard| {
+                pasteboard.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
+            });
+        }
+
+        fn write_files(&self, files: &[PathBuf]) {
+            self.replace(|pasteboard| {
+                let items: Vec<_> = files
+                    .iter()
+                    .map(|path| {
+                        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+                        let item = NSPasteboardItem::new();
+                        if let Some(url) = url.absoluteString() {
+                            item.setString_forType(&url, unsafe { NSPasteboardTypeFileURL });
+                        }
+                        if let [path] = files
+                            && is_image(path)
+                            && let Some(tiff) = NSImage::initWithContentsOfURL(NSImage::alloc(), &url)
+                                .and_then(|image| image.TIFFRepresentation())
+                        {
+                            item.setData_forType(&tiff, unsafe { NSPasteboardTypeTIFF });
+                        }
+                        ProtocolObject::from_retained(item)
+                    })
+                    .collect();
+                pasteboard.writeObjects(&NSArray::from_retained_slice(&items))
             });
         }
     }
@@ -242,7 +350,7 @@ mod tests {
 /// Windows 版再做。
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::Clipboard;
+    use super::{Clipboard, ClipboardContent};
 
     pub struct SystemClipboard;
 
@@ -261,10 +369,12 @@ mod platform {
     }
 
     impl Clipboard for SystemClipboard {
-        fn read(&self) -> Option<String> {
+        fn read(&self) -> Option<ClipboardContent> {
             None
         }
 
         fn write(&self, _text: &str) {}
+
+        fn write_files(&self, _files: &[std::path::PathBuf]) {}
     }
 }

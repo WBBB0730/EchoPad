@@ -7,7 +7,7 @@ import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 
-/** 下拉菜单里的"同步剪贴板"磁贴：收起下拉菜单，打开透明页面读剪贴板并发出（ADR-0017）。 */
+/** 下拉菜单里的"发送剪贴板"磁贴：收起下拉菜单，打开透明页面读剪贴板并发出（ADR-0017）。 */
 class SyncClipboardTileService : TileService() {
     /** 这是一个按钮，不是开关，一直显示成没打开。 */
     override fun onStartListening() {

@@ -21,6 +21,15 @@
         android:name="android.hardware.camera"
         android:required="false" />
 
+    <!-- 点收到文件的通知时，找系统自带的"文件"应用打开所在的文件夹（docs/prd/send-files.md）。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+
+            <data android:mimeType="vnd.android.document/directory" />
+        </intent>
+    </queries>
+
     <application
         android:name=".EchoPadApplication"
         android:allowBackup="true"
@@ -92,9 +101,9 @@
             android:noHistory="true"
             android:taskAffinity=""
             android:theme="@style/Theme.EchoPad.Transparent" />
-        <!-- 文字选择菜单和分享菜单里的"同步到 EchoPad"。 -->
+        <!-- 文字选择菜单和分享菜单里的"同步到 EchoPad"：文字同步剪贴板，文件发给当前电脑（docs/prd/send-files.md）。 -->
         <activity
-            android:name=".clipboard.SyncTextActivity"
+            android:name=".clipboard.SyncToEchoPadActivity"
             android:excludeFromRecents="true"
             android:exported="true"
             android:label="@string/sync_to_echopad"
@@ -113,7 +122,14 @@
 
                 <category android:name="android.intent.category.DEFAULT" />
 
-                <data android:mimeType="text/plain" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
     </application>

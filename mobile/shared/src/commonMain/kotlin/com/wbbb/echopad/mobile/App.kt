@@ -20,6 +20,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.wbbb.echopad.mobile.connection.ConnectionState
+import com.wbbb.echopad.mobile.files.SendFilesDialog
+import com.wbbb.echopad.mobile.files.rememberFilePicker
 import com.wbbb.echopad.mobile.pairing.PairingScreen
 import com.wbbb.echopad.mobile.touchpad.TouchpadScreen
 import com.wbbb.echopad.mobile.ui.EchoPadColors
@@ -39,6 +41,8 @@ fun App(core: EchoPadCore, pairingLinks: Flow<String> = emptyFlow()) {
 
     LaunchedEffect(viewModel, pairingLinks) { pairingLinks.collect(viewModel::onPairingLink) }
     LaunchedEffect(viewModel) { viewModel.notices.collect { snackbar.showSnackbar(it) } }
+    val sendingFiles by viewModel.sendFilesPrompt.asking.collectAsStateWithLifecycle()
+    val pickFiles = rememberFilePicker(viewModel::sendFiles, onUnreadable = { viewModel.notify(SyncResult.FilesUnreadable.message) })
     // 只在 App 处于前台时检查更新（docs/prd/in-app-update.md）。
     LaunchedEffect(viewModel, lifecycle) {
         val updater = viewModel.updater ?: return@LaunchedEffect
@@ -67,6 +71,7 @@ fun App(core: EchoPadCore, pairingLinks: Flow<String> = emptyFlow()) {
                         clipboardSettings = clipboardSettings,
                         onClipboardSettingsChange = viewModel::setClipboardSettings,
                         onSyncClipboard = viewModel::syncClipboard.takeIf { viewModel.canSyncClipboard },
+                        onSendFiles = pickFiles,
                         onScanned = viewModel::onPairingLink,
                         onNotice = viewModel::notify,
                         update = update,
@@ -76,5 +81,6 @@ fun App(core: EchoPadCore, pairingLinks: Flow<String> = emptyFlow()) {
                 }
             }
         }
+        sendingFiles?.let { SendFilesDialog(it) }
     }
 }

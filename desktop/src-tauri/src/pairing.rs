@@ -134,6 +134,12 @@ impl PairingStore {
         }
     }
 
+    /// 认得这把设备密钥时返回它的设备：发送文件的请求带着设备密钥（ADR-0021）。
+    pub fn device_for_key(&self, key: &str) -> Option<DeviceId> {
+        let key_hash = hash(key);
+        self.devices.iter().any(|device| device.key_hash == key_hash).then_some(DeviceId(key_hash))
+    }
+
     pub fn phones(&self) -> Vec<PairedPhone> {
         self.devices
             .iter()

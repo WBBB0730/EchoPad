@@ -3,16 +3,20 @@ package com.wbbb.echopad.mobile.clipboard
 import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
+import android.content.ContentResolver
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Process
+import com.wbbb.echopad.mobile.files.openOutgoingFiles
 
 /**
  * Android 的系统剪贴板（ADR-0017）。Android 10 起只有拿着焦点的前台页面能读，写不受限制，后台也能写。
- * 整个进程只创建一个。
+ * 相册等应用"复制"的文件在剪贴板上是 content:// 地址（docs/prd/send-files.md）。整个进程只创建一个。
  */
 class AndroidPhoneClipboard(context: Context) : PhoneClipboard {
     private val manager = context.getSystemService(ClipboardManager::class.java)
+    private val resolver = context.contentResolver
 
     /** 进程启动的时刻，和剪贴板内容的时间戳一样按开机以来的时间计。 */
     private val startedAt = Process.getStartElapsedRealtime()
@@ -20,7 +24,16 @@ class AndroidPhoneClipboard(context: Context) : PhoneClipboard {
     /** 上次回到 EchoPad 时看过的剪贴板内容的时间戳。 */
     private var checkedAt = 0L
 
-    override fun read(): String? = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.ifEmpty { null }
+    override fun read(): PhoneClipboardContent? {
+        val clip = manager.primaryClip?.takeIf { it.itemCount > 0 } ?: return null
+        val files = clip.files()
+        if (files.isEmpty()) return clip.text()?.let(PhoneClipboardContent::Text)
+        return try {
+            PhoneClipboardContent.Files(resolver.openOutgoingFiles(files))
+        } catch (e: Exception) {
+            PhoneClipboardContent.UnreadableFiles
+        }
+    }
 
     override fun write(text: String) {
         manager.setPrimaryClip(ClipData.newPlainText(LABEL, text))
@@ -37,8 +50,14 @@ class AndroidPhoneClipboard(context: Context) : PhoneClipboard {
         if (copiedAt == checkedAt || copiedAt < startedAt) return null
         checkedAt = copiedAt
         if (description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE) == true) return null
-        return read()
+        return manager.primaryClip?.takeIf { it.itemCount > 0 && it.files().isEmpty() }?.text()
     }
+
+    /** 复制的文件。 */
+    private fun ClipData.files(): List<Uri> =
+        (0 until itemCount).mapNotNull { index -> getItemAt(index).uri?.takeIf { it.scheme == ContentResolver.SCHEME_CONTENT } }
+
+    private fun ClipData.text(): String? = getItemAt(0).text?.toString()?.ifEmpty { null }
 
     private companion object {
         /** 剪贴板内容的说明，用户看不到。 */

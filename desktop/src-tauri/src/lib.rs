@@ -2,6 +2,7 @@ mod certificate;
 mod clipboard;
 mod dictation;
 mod discovery;
+mod files;
 mod input;
 mod pairing;
 mod protocol;
@@ -13,6 +14,7 @@ mod update;
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -21,22 +23,25 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
     image::Image,
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_dialog::{DialogExt, MessageDialogBuilder, MessageDialogButtons};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 
 use tokio_rustls::rustls::ServerConfig;
 
 use crate::{
     certificate::DesktopCertificate,
-    clipboard::SystemClipboard,
+    clipboard::{SyncResult, SystemClipboard},
     dictation::{CloudDictation, DictationService},
+    files::OutgoingFile,
     input::InputController,
     pairing::PairingStore,
-    server::{PORT, ServerContext},
+    server::{ClipboardSync, PORT, ServerContext, System},
     settings::{CleanupModel, CleanupPreset, Credential, DoubaoResource, RecognitionService, Settings, SettingsStore},
     status::{PhoneStatus, Status, StatusHub},
     update::{UpdateStatus, Updater},
@@ -46,8 +51,11 @@ use crate::{
 const TRAY_ID: &str = "main";
 /// 菜单栏图标用的单色模板图，由系统按菜单栏的深浅色着色。
 const TRAY_ICON: Image<'_> = tauri::include_image!("icons/tray-template.png");
-/// 右键菜单里"让某部手机控制这台电脑"的菜单项标识前缀，后面接手机端的固定标识。
+/// 右键菜单里针对某部手机的菜单项，标识是这些前缀后面接手机端的固定标识：让它控制这台电脑、发送剪贴板、发送文件、发送文本。
 const SWITCH_MENU_PREFIX: &str = "switch:";
+const SYNC_CLIPBOARD_MENU_PREFIX: &str = "sync_clipboard:";
+const SEND_FILES_MENU_PREFIX: &str = "send_files:";
+const SEND_TEXT_MENU_PREFIX: &str = "send_text:";
 
 struct AppState {
     server: Arc<ServerContext>,
@@ -137,10 +145,74 @@ fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Resul
     state.save_settings(settings)
 }
 
-/// 主窗口里的"同步剪贴板"：把电脑剪贴板上的文字发给所有在线的手机端，返回给用户的提示。
+/// 主窗口里一部手机的"发送剪贴板"，返回给用户的提示；用户取消发送文件时为 `None`。
 #[tauri::command]
-fn sync_clipboard(state: tauri::State<'_, AppState>) -> String {
-    state.server.sync_clipboard().message()
+async fn sync_clipboard(app: AppHandle, phone_id: String) -> Option<String> {
+    confirm_and_sync_clipboard(app, phone_id).await
+}
+
+/// 菜单栏菜单和主窗口里一部手机的"发送剪贴板"：剪贴板里是文件或图片时，先用系统对话框问用户
+/// （DESIGN.md、docs/prd/send-files.md）。返回给用户的提示，用户取消时为 `None`。
+async fn confirm_and_sync_clipboard(app: AppHandle, phone_id: String) -> Option<String> {
+    let server = app.state::<AppState>().server.clone();
+    let pending = match server.sync_clipboard(&phone_id) {
+        ClipboardSync::Done(result) => return Some(result.message()),
+        ClipboardSync::Confirm(pending) => pending,
+    };
+    let (answer, answered) = oneshot::channel();
+    MessageDialogBuilder::new(app.dialog().clone(), pending.question(), "")
+        .buttons(MessageDialogButtons::OkCancelCustom("发送".into(), "取消".into()))
+        .show(move |confirmed| {
+            let _ = answer.send(confirmed);
+        });
+    answered.await.unwrap_or(false).then(|| server.send_files(&phone_id, pending.files).message())
+}
+
+/// 主窗口里一部手机的"发送文件"，返回给用户的提示；用户没选文件时为 `None`。
+#[tauri::command]
+async fn send_files(app: AppHandle, phone_id: String) -> Option<String> {
+    pick_and_send_files(app, phone_id).await
+}
+
+/// 主窗口和菜单栏菜单里一部手机的"发送文件"：用系统的选文件面板选文件，选完直接发给这部手机，不再确认
+/// （docs/prd/send-files.md）。返回给用户的提示，用户没选文件时为 `None`。
+async fn pick_and_send_files(app: AppHandle, phone_id: String) -> Option<String> {
+    let (answer, answered) = oneshot::channel();
+    app.dialog().file().pick_files(move |picked| {
+        let _ = answer.send(picked);
+    });
+    let paths: Vec<PathBuf> = answered.await.ok().flatten()?.into_iter().filter_map(|path| path.into_path().ok()).collect();
+    let result = match OutgoingFile::from_paths(paths) {
+        Ok(files) => app.state::<AppState>().server.send_files(&phone_id, files),
+        Err(err) => {
+            tracing::warn!("failed to read the picked files: {err}");
+            SyncResult::FilesUnreadable
+        }
+    };
+    Some(result.message())
+}
+
+/// 主窗口里一部手机的"发送文本"：把用户打的字发给这部手机，返回给用户的提示。
+#[tauri::command]
+fn send_text(state: tauri::State<'_, AppState>, phone_id: String, text: String) -> String {
+    state.server.send_text(&phone_id, text).message()
+}
+
+/// 菜单栏菜单里的操作：在后台做完后用系统通知提示结果，点菜单时主窗口通常没开（DESIGN.md）。
+fn notify_when_done(app: &AppHandle, action: impl Future<Output = Option<String>> + Send + 'static) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(message) = action.await {
+            notify(&app, &message);
+        }
+    });
+}
+
+/// 系统通知：菜单栏菜单里操作的结果、收到文件（DESIGN.md）。
+fn notify(app: &AppHandle, message: &str) {
+    if let Err(err) = app.notification().builder().body(message).show() {
+        tracing::warn!("failed to show a notification: {err}");
+    }
 }
 
 /// 取消一部手机端的配对，它之后要重新扫码配对。
@@ -210,6 +282,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             build_tray(app)?;
 
@@ -263,6 +336,8 @@ pub fn run() {
             save_settings,
             unpair_phone,
             sync_clipboard,
+            send_files,
+            send_text,
             open_privacy_settings,
             get_update_status,
             check_for_updates,
@@ -282,7 +357,7 @@ pub fn run() {
 /// 平铺和帮助搜索；macOS 自己加的这些项靠 Info.plist 把默认语言设成简体中文。
 #[cfg(target_os = "macos")]
 fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
-    use tauri::menu::{AboutMetadata, HELP_SUBMENU_ID, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID};
+    use tauri::menu::{AboutMetadata, HELP_SUBMENU_ID, Submenu, WINDOW_SUBMENU_ID};
 
     let package = app.package_info();
     let name = &package.name;
@@ -365,13 +440,6 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
-            // 点菜单时主窗口通常没开，结果用系统通知提示（DESIGN.md）。
-            "sync_clipboard" => {
-                let message = app.state::<AppState>().server.sync_clipboard().message();
-                if let Err(err) = app.notification().builder().body(message).show() {
-                    tracing::warn!("failed to show a notification: {err}");
-                }
-            }
             "quit" => {
                 app.state::<Arc<Updater>>().install_on_quit();
                 app.exit(0);
@@ -379,6 +447,14 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             id => {
                 if let Some(phone_id) = id.strip_prefix(SWITCH_MENU_PREFIX) {
                     app.state::<AppState>().server.request_switch(phone_id);
+                } else if let Some(phone_id) = id.strip_prefix(SYNC_CLIPBOARD_MENU_PREFIX) {
+                    notify_when_done(app, confirm_and_sync_clipboard(app.clone(), phone_id.into()));
+                } else if let Some(phone_id) = id.strip_prefix(SEND_FILES_MENU_PREFIX) {
+                    notify_when_done(app, pick_and_send_files(app.clone(), phone_id.into()));
+                } else if let Some(phone_id) = id.strip_prefix(SEND_TEXT_MENU_PREFIX) {
+                    // 打字要有输入框：打开主窗口，让它弹出发给这部手机的输入框。
+                    show_main_window(app);
+                    let _ = app.emit("send-text", phone_id);
                 }
             }
         })
@@ -386,18 +462,23 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 右键菜单：每部在线的手机端一项"让它控制这台电脑"；有手机在线时还有"同步剪贴板"。
+/// 右键菜单：每部在线的手机端一组，"让它控制这台电脑""发送剪贴板到它""发送文件到它…""发送文本到它…"，组和组之间用分隔线隔开
+/// （DESIGN.md）。
 fn tray_menu(app: &AppHandle, phones: &[PhoneStatus]) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(app, "open", "打开 EchoPad", true, None::<&str>)?)?;
-    let online: Vec<_> = phones.iter().filter(|phone| phone.online).collect();
-    for phone in &online {
-        let id = format!("{SWITCH_MENU_PREFIX}{}", phone.id);
-        menu.append(&MenuItem::with_id(app, id, format!("让 {} 控制这台电脑", phone.name), true, None::<&str>)?)?;
+    for phone in phones.iter().filter(|phone| phone.online) {
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        for (prefix, label) in [
+            (SWITCH_MENU_PREFIX, format!("让 {} 控制这台电脑", phone.name)),
+            (SYNC_CLIPBOARD_MENU_PREFIX, format!("发送剪贴板到 {}", phone.name)),
+            (SEND_FILES_MENU_PREFIX, format!("发送文件到 {}…", phone.name)),
+            (SEND_TEXT_MENU_PREFIX, format!("发送文本到 {}…", phone.name)),
+        ] {
+            menu.append(&MenuItem::with_id(app, format!("{prefix}{}", phone.id), label, true, None::<&str>)?)?;
+        }
     }
-    if !online.is_empty() {
-        menu.append(&MenuItem::with_id(app, "sync_clipboard", "同步剪贴板", true, None::<&str>)?)?;
-    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)?;
     Ok(menu)
 }
@@ -476,15 +557,14 @@ fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerCo
     );
 
     let clipboard = Arc::new(SystemClipboard::new());
-    let server = Arc::new(ServerContext::new(
-        desktop_name(),
-        host,
-        certificate.fingerprint(),
-        pairing,
-        status.clone(),
-        Arc::new(input),
-        clipboard.clone(),
-    ));
+    let notifier = app.clone();
+    let system = System {
+        input: Arc::new(input),
+        clipboard: clipboard.clone(),
+        downloads: app.path().download_dir()?,
+        notify: Box::new(move |message| notify(&notifier, &message)),
+    };
+    let server = Arc::new(ServerContext::new(desktop_name(), host, certificate.fingerprint(), pairing, status.clone(), system));
     let (enabled, copied) = (server.clone(), server.clone());
     clipboard.watch(
         move || enabled.clipboard_auto_send(),
@@ -501,7 +581,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        clipboard::Clipboard,
+        clipboard::{Clipboard, ClipboardContent},
         input::{InputCommand, InputSink},
     };
 
@@ -514,11 +594,13 @@ mod tests {
     struct IgnoredClipboard;
 
     impl Clipboard for IgnoredClipboard {
-        fn read(&self) -> Option<String> {
+        fn read(&self) -> Option<ClipboardContent> {
             None
         }
 
         fn write(&self, _text: &str) {}
+
+        fn write_files(&self, _files: &[std::path::PathBuf]) {}
     }
 
     fn state() -> AppState {
@@ -533,8 +615,12 @@ mod tests {
                 "fingerprint".into(),
                 pairing,
                 status,
-                Arc::new(IgnoredInput),
-                Arc::new(IgnoredClipboard),
+                System {
+                    input: Arc::new(IgnoredInput),
+                    clipboard: Arc::new(IgnoredClipboard),
+                    downloads: dir.clone(),
+                    notify: Box::new(|_| {}),
+                },
             )),
             settings: SettingsStore::load(dir.join("settings.json")).unwrap(),
         }

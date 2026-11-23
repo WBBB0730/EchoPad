@@ -3,9 +3,10 @@ package com.wbbb.echopad.mobile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.wbbb.echopad.mobile.clipboard.ClipboardSettings
-import com.wbbb.echopad.mobile.clipboard.message
 import com.wbbb.echopad.mobile.connection.ConnectionNotice
 import com.wbbb.echopad.mobile.dictation.DictationController
+import com.wbbb.echopad.mobile.files.OutgoingFile
+import com.wbbb.echopad.mobile.files.SendFilesPrompt
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.touchpad.TouchpadSettings
 import com.wbbb.echopad.mobile.typing.KeyboardInput
@@ -24,6 +25,7 @@ class EchoPadViewModel(core: EchoPadCore) : ViewModel() {
     private val storage = core.storage
     val connection = core.connection
     private val clipboardSync = core.clipboardSync
+    private val fileTransfers = core.fileTransfers
     val dictation = DictationController(connection, viewModelScope)
     val keyboard = KeyboardInput(connection)
     val updater = core.platform.packages?.let(::AppUpdater)
@@ -64,12 +66,21 @@ class EchoPadViewModel(core: EchoPadCore) : ViewModel() {
         viewModelScope.launch { storage.setClipboardSettings(settings) }
     }
 
-    /** 平台支持剪贴板时（iOS 版还没有）才有 EchoPad 里的"同步剪贴板"按钮。 */
+    /** 平台支持剪贴板时（iOS 版还没有）才有 EchoPad 里的"发送剪贴板"按钮。 */
     val canSyncClipboard: Boolean get() = clipboardSync != null
 
-    /** EchoPad 里的"同步剪贴板"：读手机剪贴板发给所有在线的电脑，结果用 Snackbar 提示。 */
+    /** 剪贴板里是文件时，发之前的确认框。 */
+    val sendFilesPrompt = SendFilesPrompt()
+
+    /** EchoPad 里的"发送剪贴板"：文字发给所有在线的电脑，文件确认后发给当前电脑（docs/prd/send-files.md），结果用 Snackbar 提示。 */
     fun syncClipboard() {
-        clipboardSync?.let { notify(it.syncClipboard().message) }
+        val sync = clipboardSync ?: return
+        viewModelScope.launch { sync.syncClipboard(sendFilesPrompt::ask)?.let { notify(it.message) } }
+    }
+
+    /** EchoPad 里的"发送文件"：用户在文件选择器里选好的文件，直接发给当前电脑（docs/prd/send-files.md），结果用 Snackbar 提示。 */
+    fun sendFiles(files: List<OutgoingFile>) {
+        viewModelScope.launch { fileTransfers.sendToCurrentDesktop(files)?.let { notify(it.message) } }
     }
 
     /** 打开设置时 [force] 为 false，距上次检查不足 5 分钟就跳过；手动检查为 true。 */

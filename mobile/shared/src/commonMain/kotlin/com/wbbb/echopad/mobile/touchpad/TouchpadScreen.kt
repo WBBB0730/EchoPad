@@ -104,6 +104,7 @@ import com.wbbb.echopad.mobile.update.UpdateState
 import echopad.shared.generated.resources.Res
 import echopad.shared.generated.resources.content_paste_go
 import echopad.shared.generated.resources.keyboard
+import echopad.shared.generated.resources.upload_file
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
@@ -128,8 +129,9 @@ fun TouchpadScreen(
     /** 剪贴板同步设置；平台不支持时为 null。 */
     clipboardSettings: ClipboardSettings?,
     onClipboardSettingsChange: (ClipboardSettings) -> Unit,
-    /** EchoPad 里的"同步剪贴板"；平台不支持时为 null。 */
+    /** EchoPad 里的"发送剪贴板"；平台不支持时为 null。 */
     onSyncClipboard: (() -> Unit)?,
+    onSendFiles: (() -> Unit)?,
     onScanned: (String) -> Unit,
     onNotice: (String) -> Unit,
     /** 应用内更新的状态；平台不支持时为 null。 */
@@ -175,6 +177,8 @@ fun TouchpadScreen(
     val syncClipboardButton = @Composable {
         // 有电脑在线时才显示：没有电脑在线时同步不出去（DESIGN.md）。
         if (onSyncClipboard != null && desktops.any { it.online }) SyncClipboardButton(onSyncClipboard)
+        // 文件只发给当前电脑，它在线时才显示（docs/prd/send-files.md）。
+        if (onSendFiles != null && connected) SendFilesButton(onSendFiles)
     }
     val settingsButton = @Composable {
         TextButton(onClick = { settingsOpen = true }) {
@@ -758,17 +762,32 @@ private fun ScrollDirectionChoice(label: String, value: ScrollDirection, onValue
     }
 }
 
-/** 顶部的"同步剪贴板"：把手机剪贴板上的文字发给所有在线的电脑；图标没有文字，长按显示名称。 */
+/** 顶部的"发送剪贴板"：把手机剪贴板上的文字发给所有在线的电脑；图标没有文字，长按显示名称。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SyncClipboardButton(onClick: () -> Unit) {
     TooltipBox(
         positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
-        tooltip = { PlainTooltip { Text("同步剪贴板") } },
+        tooltip = { PlainTooltip { Text("发送剪贴板") } },
         state = rememberTooltipState(),
     ) {
         IconButton(onClick = onClick) {
-            Icon(painterResource(Res.drawable.content_paste_go), contentDescription = "同步剪贴板", tint = EchoPadColors.TextMuted)
+            Icon(painterResource(Res.drawable.content_paste_go), contentDescription = "发送剪贴板", tint = EchoPadColors.TextMuted)
+        }
+    }
+}
+
+/** 顶部的"发送文件"：用系统的文件选择器选文件发给当前电脑；图标没有文字，长按显示名称。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SendFilesButton(onClick: () -> Unit) {
+    TooltipBox(
+        positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
+        tooltip = { PlainTooltip { Text("发送文件") } },
+        state = rememberTooltipState(),
+    ) {
+        IconButton(onClick = onClick) {
+            Icon(painterResource(Res.drawable.upload_file), contentDescription = "发送文件", tint = EchoPadColors.TextMuted)
         }
     }
 }

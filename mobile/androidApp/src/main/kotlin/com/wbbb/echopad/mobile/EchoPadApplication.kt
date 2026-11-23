@@ -8,6 +8,7 @@ import com.wbbb.echopad.mobile.clipboard.ClipboardSync
 import com.wbbb.echopad.mobile.connection.NsdDesktopFinder
 import com.wbbb.echopad.mobile.connection.networkChanges
 import com.wbbb.echopad.mobile.connection.screenTurnedOn
+import com.wbbb.echopad.mobile.files.MediaStoreIncomingFiles
 import com.wbbb.echopad.mobile.update.AndroidAppPackages
 
 class EchoPadApplication : Application() {
@@ -24,6 +25,8 @@ class EchoPadApplication : Application() {
                 screenTurnedOn = screenTurnedOn(this),
                 packages = AndroidAppPackages(this),
                 clipboard = AndroidPhoneClipboard(this),
+                // 安卓 10 起存文件不需要存储权限；更早的系统不能接收文件（docs/prd/send-files.md）。
+                incomingFiles = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStoreIncomingFiles(this) else null,
             ),
         )
     }

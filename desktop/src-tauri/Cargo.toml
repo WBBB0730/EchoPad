@@ -24,7 +24,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.54.1", features = ["full"] }
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", features = ["multipart", "ws"] }
 futures-util = "0.3.34"
 prost = "0.14.4"
 # 0.6.1 在 macOS 上会一直用启动时的主显示器换算指针位置，显示器变化后指针只能贴着屏幕顶部移动；
@@ -46,6 +46,7 @@ gethostname = "1.1.0"
 tauri-plugin-opener = "2.7.2"
 tauri-plugin-updater = "2.14.1"
 tauri-plugin-notification = "2.8.1"
+tauri-plugin-dialog = "2.8.4"
 semver = "1.0.28"
 mdns-sd = "0.21.6"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1"] }
@@ -55,6 +56,8 @@ tokio-rustls = "0.26"
 # TCP 保活（ADR-0019）；设置探测次数要用 all 特性。
 socket2 = { version = "0.6.5", features = ["all"] }
 hyper = { version = "1", features = ["server", "http1"] }
+tempfile = "3.27.0"
+tokio-util = { version = "0.7.20", features = ["io"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -73,3 +76,4 @@ objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-system-configuration = "0.3.2"
+objc2-uniform-type-identifiers = "0.3.2"

@@ -6,6 +6,7 @@ import com.wbbb.echopad.mobile.pairing.PairedDesktopStore
 import com.wbbb.echopad.mobile.pairing.PairingLink
 import com.wbbb.echopad.mobile.protocol.ClientMessage
 import com.wbbb.echopad.mobile.protocol.ClipboardText
+import com.wbbb.echopad.mobile.protocol.FileOffer
 import com.wbbb.echopad.mobile.protocol.Hello
 import com.wbbb.echopad.mobile.protocol.OperatingSystem
 import com.wbbb.echopad.mobile.protocol.ProtocolVersion
@@ -64,6 +65,12 @@ data class DesktopEntry(val id: String, val name: String, val online: Boolean)
 /** 电脑端 [desktopId] 发来的剪贴板。 */
 data class DesktopClipboard(val desktopId: String, val clipboard: ClipboardText)
 
+/** 电脑端 [desktopId] 发来的文件清单（docs/prd/send-files.md）。 */
+data class DesktopFileOffer(val desktopId: String, val offer: FileOffer)
+
+/** 要用的电脑端不在线，或者用到一半断线了。 */
+class DesktopOfflineException : Exception("the desktop is offline")
+
 sealed interface ConnectionNotice {
     /** 扫到的配对码已经用过或已失效。 */
     data object PairingCodeRejected : ConnectionNotice
@@ -84,7 +91,8 @@ sealed interface ConnectionNotice {
  * 配对、取消配对、切换以及各条连接报告的结果，都排队按顺序处理，状态不会被并发改乱。
  *
  * 剪贴板同步不只是当前电脑（docs/prd/clipboard-sync.md）：任何一台电脑端发来的剪贴板都交给 [clipboardTexts]，
- * [sendToAll] 发给所有在线的电脑端。
+ * [sendToAll] 发给所有在线的电脑端。发送文件也一样（docs/prd/send-files.md）：任何一台电脑端发来的文件清单都交给
+ * [fileOffers]，文件另发 HTTPS 请求，用 [whileConnected] 拿到它现在的地址。
  */
 class DesktopConnection(
     private val store: PairedDesktopStore,
@@ -101,8 +109,8 @@ class DesktopConnection(
     /** 当前电脑的电脑端标识。 */
     val activeId: StateFlow<String?> = _activeId.asStateFlow()
 
-    /** 各台电脑端是否在线，以及在线时的名称和系统。没有记录的就是正在连接。 */
-    private val online = MutableStateFlow<Map<String, ConnectionState.Connected>>(emptyMap())
+    /** 在线的电脑端，没有记录的就是正在连接。每次连上都是一个新对象。 */
+    private val online = MutableStateFlow<Map<String, Online>>(emptyMap())
 
     /** 和哪些电脑端版本不兼容，以及该更新哪一端；连上后清除。 */
     private val mismatched = MutableStateFlow<Map<String, OutdatedApp>>(emptyMap())
@@ -110,14 +118,14 @@ class DesktopConnection(
     private val outgoing = MutableStateFlow<Map<String, SendChannel<ByteArray>>>(emptyMap())
 
     val desktops: StateFlow<List<DesktopEntry>> = combine(paired, online) { desktops, online ->
-        desktops.map { DesktopEntry(it.id, online[it.id]?.desktopName ?: it.name, it.id in online) }
+        desktops.map { DesktopEntry(it.id, online[it.id]?.desktop?.name ?: it.name, it.id in online) }
     }.stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     val state: StateFlow<ConnectionState> = combine(loaded, _activeId, online, mismatched) { loaded, activeId, online, mismatched ->
         when {
             !loaded -> ConnectionState.Starting
             activeId == null -> ConnectionState.Unpaired
-            else -> online[activeId]
+            else -> online[activeId]?.let { ConnectionState.Connected(it.desktop.name, it.operatingSystem) }
                 ?: mismatched[activeId]?.let(ConnectionState::VersionMismatch)
                 ?: ConnectionState.Connecting
         }
@@ -144,6 +152,11 @@ class DesktopConnection(
 
     /** 任何一台电脑端发来的剪贴板，不只是当前电脑。 */
     val clipboardTexts: SharedFlow<DesktopClipboard> = _clipboardTexts.asSharedFlow()
+
+    private val _fileOffers = MutableSharedFlow<DesktopFileOffer>(extraBufferCapacity = 16)
+
+    /** 任何一台电脑端发来的文件清单，不只是当前电脑。 */
+    val fileOffers: SharedFlow<DesktopFileOffer> = _fileOffers.asSharedFlow()
 
     /** 读取已保存的配对之后才开始处理，扫码冷启动 App 时，新的配对不会被旧状态覆盖。 */
     private val commands = Channel<Command>(Channel.UNLIMITED)
@@ -186,10 +199,30 @@ class DesktopConnection(
         return outgoing.value[id]?.trySend(message.encode())?.isSuccess == true
     }
 
+    /** 发给电脑端 [id]。它不在线时直接丢弃并返回 false。 */
+    fun sendTo(id: String, message: ClientMessage): Boolean = outgoing.value[id]?.trySend(message.encode())?.isSuccess == true
+
     /** 发给除 [except] 以外所有在线的电脑端，返回发到了哪几台（电脑端标识）。 */
     fun sendToAll(message: ClientMessage, except: String? = null): List<String> {
         val bytes = message.encode()
         return outgoing.value.filter { (id, queue) -> id != except && queue.trySend(bytes).isSuccess }.keys.toList()
+    }
+
+    /**
+     * 电脑端 [id] 在线时执行 [block]，交给它这台电脑现在的地址和凭据：发送文件另发 HTTPS 请求时用（ADR-0021）。
+     * 它不在线时不执行，执行到一半断线时取消 [block]，都抛出 [DesktopOfflineException]；断线靠连接的心跳及时发现。
+     */
+    suspend fun <T> whileConnected(id: String, block: suspend (PairedDesktop) -> T): T = coroutineScope {
+        val connected = online.value[id] ?: throw DesktopOfflineException()
+        val watch = launch {
+            online.first { it[id] !== connected }
+            throw DesktopOfflineException()
+        }
+        try {
+            block(connected.desktop)
+        } finally {
+            watch.cancel()
+        }
     }
 
     private suspend fun handle(command: Command) {
@@ -396,7 +429,7 @@ class DesktopConnection(
                 val queue = Channel<ByteArray>(Channel.UNLIMITED)
                 // 先能发消息、再算在线：看到在线就能发出去。
                 outgoing.update { it + (id to queue) }
-                online.update { it + (id to ConnectionState.Connected(desktop.name, welcome.operating_system)) }
+                online.update { it + (id to Online(desktop, welcome.operating_system)) }
                 try {
                     launch {
                         for (bytes in queue) session.send(bytes)
@@ -417,6 +450,7 @@ class DesktopConnection(
             when {
                 message.switch_request != null -> commands.send(Command.Switch(id, announce = true))
                 message.clipboard_text != null -> _clipboardTexts.emit(DesktopClipboard(id, message.clipboard_text))
+                message.file_offer != null -> _fileOffers.emit(DesktopFileOffer(id, message.file_offer))
                 _activeId.value == id -> _messages.emit(message)
             }
         }
@@ -454,6 +488,9 @@ class DesktopConnection(
                 }
         }
     }
+
+    /** 连上的一台电脑端：它现在的地址和凭据，以及它的系统。 */
+    private class Online(val desktop: PairedDesktop, val operatingSystem: OperatingSystem)
 
     private enum class Wake { WokeUp, Moved }
 

@@ -1,7 +1,9 @@
 package com.wbbb.echopad.mobile.connection
 
 import io.ktor.client.HttpClient
+import io.ktor.client.HttpClientConfig
 import io.ktor.client.engine.cio.CIO
+import io.ktor.client.engine.cio.CIOEngineConfig
 import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocketSession
@@ -33,22 +35,30 @@ private const val CERTIFICATE_NAME = "echopad"
 internal expect fun TLSConfigBuilder.trustOnly(fingerprint: String)
 
 /**
+ * 连电脑端用的 Ktor CIO 客户端，连接和发送文件（ADR-0021）共用：只认证书指纹为 [fingerprint] 的那台电脑端（ADR-0014），
+ * 长连接和大文件都不受单次请求超时限制。
+ */
+internal fun desktopHttpClient(fingerprint: String, block: HttpClientConfig<CIOEngineConfig>.() -> Unit = {}) =
+    HttpClient(CIO) {
+        engine {
+            requestTimeout = 0
+            endpoint.connectTimeout = 3_000
+            endpoint.connectAttempts = 1
+            https {
+                serverName = CERTIFICATE_NAME
+                trustOnly(fingerprint)
+            }
+        }
+        block()
+    }
+
+/**
  * 基于 Ktor CIO 引擎、TLS 上的 WebSocket 连接（ADR-0003、ADR-0014）。CIO 在 Android 和 iOS 上都能使用心跳设置，
  * 发现断线靠心跳：每 2 秒一次，5 秒内收不到回应就断开（ADR-0004）。每条连接只认自己那台电脑端的证书。
  */
 class KtorTransport : Transport {
     override suspend fun <T> connect(host: String, port: Int, fingerprint: String, block: suspend (Session) -> T): T {
-        val client = HttpClient(CIO) {
-            engine {
-                // 长连接不受单次请求超时限制。
-                requestTimeout = 0
-                endpoint.connectTimeout = 3_000
-                endpoint.connectAttempts = 1
-                https {
-                    serverName = CERTIFICATE_NAME
-                    trustOnly(fingerprint)
-                }
-            }
+        val client = desktopHttpClient(fingerprint) {
             install(WebSockets) {
                 pingIntervalMillis = 2_000
             }

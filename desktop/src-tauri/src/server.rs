@@ -1,9 +1,10 @@
 //! 手机端连接的 WebSocket 服务（ADR-0003、ADR-0004、ADR-0014、ADR-0015、docs/prd/pairing.md），
-//! 以及在手机端之间转发剪贴板（docs/prd/clipboard-sync.md）。
+//! 在手机端之间转发剪贴板（docs/prd/clipboard-sync.md），以及发送文件的上传、下载接口（docs/prd/send-files.md、ADR-0021）。
 
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
+    path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,11 +15,12 @@ use std::{
 use axum::{
     Router,
     extract::{
-        Request, State, WebSocketUpgrade,
+        DefaultBodyLimit, FromRequestParts, Multipart, Path, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    response::Response,
-    routing::get,
+    http::{StatusCode, header, request::Parts},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitStream};
 use hyper::body::Incoming;
@@ -34,14 +36,17 @@ use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 use tower_service::Service;
 
 use crate::{
-    clipboard::{Clipboard, MAX_TEXT_BYTES, SyncResult, SyncedClipboard, now_millis},
+    clipboard::{Clipboard, ClipboardContent, MAX_TEXT_BYTES, SyncResult, SyncedClipboard, now_millis},
+    files::{self, OutgoingFile, PendingFiles},
     settings::ClipboardSettings,
     dictation::{DictationHandle, DictationService},
     input::{InputCommand, InputSink, Modifier, MouseButton, Owner, Shortcut, SpecialKey},
-    pairing::{AuthOutcome, Credential, DeviceId, PairingStore, pairing_link},
+    pairing::{AuthOutcome, Credential, DeviceId, PairedPhone, PairingStore, pairing_link},
     protocol::{
-        self, ClientMessage, ClipboardText, DictationFailed, Hello, ModifierKey, OperatingSystem, Rejected, ServerMessage,
-        SwitchRequest, Welcome, button_action::Kind, client_message, hello, key_press, rejected, server_message, shortcut_action,
+        self, ClientMessage, ClipboardText, DictationFailed, FileOffer, FileOfferResult, Hello, ModifierKey, OperatingSystem,
+        Rejected, ServerMessage,
+        SwitchRequest, Welcome, button_action::Kind, client_message, file_offer_result, hello, key_press, rejected, server_message,
+        shortcut_action,
         zoom::Phase as ZoomPhase,
     },
     status::{OutdatedApp, PhoneStatus, StatusHub},
@@ -62,6 +67,23 @@ const KEEPALIVE: TcpKeepalive = TcpKeepalive::new()
     .with_interval(Duration::from_secs(10))
     .with_retries(3);
 
+/// 电脑端操作的系统功能，测试里换成假的。
+pub struct System {
+    pub input: Arc<dyn InputSink>,
+    pub clipboard: Arc<dyn Clipboard>,
+    /// 手机端发来的文件存进这个文件夹。
+    pub downloads: PathBuf,
+    /// 显示系统通知。
+    pub notify: Box<dyn Fn(String) + Send + Sync>,
+}
+
+/// 用户在电脑端主动同步剪贴板。
+pub enum ClipboardSync {
+    Done(SyncResult),
+    /// 剪贴板里是文件或图片，等用户确认后再发（docs/prd/send-files.md）。
+    Confirm(PendingFiles),
+}
+
 pub struct ServerContext {
     pub desktop_name: String,
     /// 配对码里的局域网地址，电脑换了网络后会更新。
@@ -74,6 +96,8 @@ pub struct ServerContext {
     /// 缺少语音输入的配置时为 `None`；保存设置后会被替换，不用重启电脑端。
     dictation: RwLock<Option<Arc<dyn DictationService>>>,
     clipboard: Arc<dyn Clipboard>,
+    downloads: PathBuf,
+    notify: Box<dyn Fn(String) + Send + Sync>,
     /// 剪贴板同步的两个开关，保存设置后更新。
     clipboard_auto_send: AtomicBool,
     clipboard_receive: AtomicBool,
@@ -88,6 +112,8 @@ struct Session {
     device: DeviceId,
     outbound: mpsc::UnboundedSender<ServerMessage>,
     close: Arc<Notify>,
+    /// 发给这部手机端、还没下载的文件，按清单标识和序号存放（ADR-0021）。每个只能下载一次，断线时随连接作废。
+    offered: HashMap<(String, u32), OutgoingFile>,
 }
 
 impl ServerContext {
@@ -97,9 +123,9 @@ impl ServerContext {
         fingerprint: String,
         pairing: PairingStore,
         status: Arc<StatusHub>,
-        input: Arc<dyn InputSink>,
-        clipboard: Arc<dyn Clipboard>,
+        system: System,
     ) -> Self {
+        let System { input, clipboard, downloads, notify } = system;
         let context = Self {
             desktop_name,
             host: Mutex::new(host),
@@ -109,6 +135,8 @@ impl ServerContext {
             input,
             dictation: RwLock::new(None),
             clipboard,
+            downloads,
+            notify,
             clipboard_auto_send: AtomicBool::new(false),
             clipboard_receive: AtomicBool::new(false),
             synced_clipboard: Mutex::new(SyncedClipboard::unknown_since(now_millis())),
@@ -153,15 +181,8 @@ impl ServerContext {
 
     /// 让一部在线的手机端切换过来，把这台电脑端设为它的当前电脑（ADR-0015）。
     pub fn request_switch(&self, phone_id: &str) {
-        let phone = self.pairing.lock().unwrap().phones().into_iter().find(|phone| phone.id == phone_id);
-        let Some(phone) = phone else {
-            return;
-        };
-        let request = ServerMessage {
-            body: Some(server_message::Body::SwitchRequest(SwitchRequest {})),
-        };
-        for session in self.sessions.lock().unwrap().values().filter(|session| session.device == phone.device) {
-            let _ = session.outbound.send(request.clone());
+        if let Some(phone) = self.phone(phone_id) {
+            self.send_to(&phone, server_message::Body::SwitchRequest(SwitchRequest {}));
         }
     }
 
@@ -196,22 +217,135 @@ impl ServerContext {
         self.send_clipboard(copied, None);
     }
 
-    /// 用户在电脑端主动同步（菜单栏菜单、主窗口）：把电脑剪贴板上的文字发给所有在线的手机端，
-    /// 算一次新的复制，即使内容和现有的相同也照发；不受两个开关影响。
-    pub fn sync_clipboard(&self) -> SyncResult {
-        let Some(text) = self.clipboard.read() else {
-            return SyncResult::NoText;
+    /// 用户在电脑端主动同步给手机端 `phone_id`（主窗口、菜单栏菜单里这部手机的"发送剪贴板"）。剪贴板上是文字时发给它，
+    /// 算一次新的复制，即使内容和现有的相同也照发，不受两个开关影响；是文件或图片时先交给用户确认（docs/prd/send-files.md）。
+    pub fn sync_clipboard(&self, phone_id: &str) -> ClipboardSync {
+        let Some(phone) = self.phone(phone_id).filter(|phone| self.is_online(phone)) else {
+            return ClipboardSync::Done(SyncResult::PhoneOffline);
         };
+        let files = match self.clipboard.read() {
+            None => return ClipboardSync::Done(SyncResult::NoText),
+            Some(ClipboardContent::Text(text)) => return ClipboardSync::Done(self.sync_text(text, phone)),
+            Some(ClipboardContent::Image(png)) => vec![OutgoingFile::image(png)],
+            Some(ClipboardContent::Files(paths)) => match OutgoingFile::from_paths(paths) {
+                Ok(files) if files.is_empty() => return ClipboardSync::Done(SyncResult::OnlyFolders),
+                Ok(files) => files,
+                Err(err) => {
+                    tracing::warn!("failed to read the copied files: {err}");
+                    return ClipboardSync::Done(SyncResult::FilesUnreadable);
+                }
+            },
+        };
+        ClipboardSync::Confirm(PendingFiles { files, phone: phone.name })
+    }
+
+    /// 用户在电脑端给手机端 `phone_id` 发一段文字（主窗口、菜单栏菜单里这部手机的"发送文本"）：效果和在电脑上复制这段文字
+    /// 再发送剪贴板一样，只是不动电脑自己的剪贴板（docs/prd/clipboard-sync.md）。
+    pub fn send_text(&self, phone_id: &str, text: String) -> SyncResult {
+        match self.phone(phone_id).filter(|phone| self.is_online(phone)) {
+            Some(phone) => self.sync_text(text, phone),
+            None => SyncResult::PhoneOffline,
+        }
+    }
+
+    fn sync_text(&self, text: String, phone: PairedPhone) -> SyncResult {
         if text.len() > MAX_TEXT_BYTES {
             return SyncResult::TooLong;
         }
         let copied = self.synced_clipboard.lock().unwrap().copy(text, now_millis());
-        let devices = self.send_clipboard(copied, None);
-        if devices.is_empty() {
-            return SyncResult::NoPhoneOnline;
+        if !self.send_to(&phone, server_message::Body::ClipboardText(copied)) {
+            return SyncResult::PhoneOffline;
         }
+        SyncResult::TextSent(phone.name)
+    }
+
+    /// 把文件发给手机端 `phone_id`：通过连接告诉它有哪些文件，它再逐个下载（ADR-0021）。
+    pub fn send_files(&self, phone_id: &str, files: Vec<OutgoingFile>) -> SyncResult {
+        let Some(phone) = self.phone(phone_id) else {
+            return SyncResult::PhoneOffline;
+        };
+        let offer_id = uuid::Uuid::new_v4().simple().to_string();
+        let offer = ServerMessage {
+            body: Some(server_message::Body::FileOffer(FileOffer {
+                offer_id: offer_id.clone(),
+                files: files.iter().map(|file| protocol::OfferedFile { name: file.name.clone(), size: file.size }).collect(),
+            })),
+        };
+        let mut sent = false;
+        for session in self.sessions.lock().unwrap().values_mut().filter(|session| session.device == phone.device) {
+            session.offered.extend((0..).zip(&files).map(|(index, file)| ((offer_id.clone(), index), file.clone())));
+            sent |= session.outbound.send(offer.clone()).is_ok();
+        }
+        if !sent {
+            return SyncResult::PhoneOffline;
+        }
+        SyncResult::FilesSending(phone.name)
+    }
+
+    /// 手机端来下载清单里的一个文件：只给收到这份清单的手机端，每个文件只能下载一次。
+    fn take_offered(&self, device: &DeviceId, offer_id: String, index: u32) -> Option<OutgoingFile> {
+        let key = (offer_id, index);
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.values_mut().filter(|session| session.device == *device).find_map(|session| session.offered.remove(&key))
+    }
+
+    /// 手机端发来一批文件，`saved` 是已经存进"下载"文件夹的那些：收全了就放进电脑剪贴板；收全没收全都用系统通知提示
+    /// （docs/prd/send-files.md）。
+    fn receive_files(&self, saved: &[PathBuf], complete: bool) {
+        let message = match (complete, saved.len()) {
+            (true, count) => {
+                self.clipboard.write_files(saved);
+                format!("收到 {count} 个文件，已复制到剪贴板")
+            }
+            (false, 0) => "没能接收文件".into(),
+            (false, count) => format!("接收中断，已保存 {count} 个文件"),
+        };
+        (self.notify)(message);
+    }
+
+    /// 手机端处理完电脑端发去的一份文件清单：清单作废，用系统通知提示结果，用户在手机上取消的不提示（docs/prd/send-files.md）。
+    fn file_offer_result(&self, owner: Owner, result: FileOfferResult) {
+        let device = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let Some(session) = sessions.get_mut(&owner) else {
+                return;
+            };
+            session.offered.retain(|(offer_id, _), _| *offer_id != result.offer_id);
+            session.device.clone()
+        };
         let phones = self.pairing.lock().unwrap().phones();
-        SyncResult::Sent(phones.into_iter().filter(|phone| devices.contains(&phone.device)).map(|phone| phone.name).collect())
+        let Some(phone) = phones.into_iter().find(|phone| phone.device == device) else {
+            return;
+        };
+        let name = phone.name;
+        let message = match result.outcome() {
+            file_offer_result::Outcome::Saved => format!("{name} 已保存 {} 个文件", result.saved),
+            file_offer_result::Outcome::Failed if result.saved == 0 => format!("{name} 没能接收文件"),
+            file_offer_result::Outcome::Failed => format!("{name} 接收中断，已保存 {} 个文件", result.saved),
+            file_offer_result::Outcome::Unsupported => format!("{name} 的系统版本太低，不能接收文件"),
+            file_offer_result::Outcome::Cancelled | file_offer_result::Outcome::Unspecified => return,
+        };
+        (self.notify)(message);
+    }
+
+    /// 配过的手机端 `phone_id`，已经取消配对时为 `None`。
+    fn phone(&self, phone_id: &str) -> Option<PairedPhone> {
+        self.pairing.lock().unwrap().phones().into_iter().find(|phone| phone.id == phone_id)
+    }
+
+    fn is_online(&self, phone: &PairedPhone) -> bool {
+        self.sessions.lock().unwrap().values().any(|session| session.device == phone.device)
+    }
+
+    /// 发给一部手机端，返回它是否在线、发出去了。
+    fn send_to(&self, phone: &PairedPhone, body: server_message::Body) -> bool {
+        let message = ServerMessage { body: Some(body) };
+        let sessions = self.sessions.lock().unwrap();
+        let mut sent = false;
+        for session in sessions.values().filter(|session| session.device == phone.device) {
+            sent |= session.outbound.send(message.clone()).is_ok();
+        }
+        sent
     }
 
     /// 一部手机端发来了剪贴板：比现有的新才用。开着接收就写进电脑剪贴板；不论接收开没开，都转给其他在线的手机端，
@@ -232,18 +366,14 @@ impl ServerContext {
         self.send_clipboard(clipboard, Some(from));
     }
 
-    /// 发给在线的手机端，返回发到了哪几部；`except` 是发来这条内容的连接，不发回给它。写不写进剪贴板由手机端自己决定。
-    fn send_clipboard(&self, clipboard: ClipboardText, except: Option<Owner>) -> Vec<DeviceId> {
+    /// 发给所有在线的手机端；`except` 是发来这条内容的连接，不发回给它。写不写进剪贴板由手机端自己决定。
+    fn send_clipboard(&self, clipboard: ClipboardText, except: Option<Owner>) {
         let message = ServerMessage {
             body: Some(server_message::Body::ClipboardText(clipboard)),
         };
-        self.sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(owner, session)| Some(**owner) != except && session.outbound.send(message.clone()).is_ok())
-            .map(|(_, session)| session.device.clone())
-            .collect()
+        for (_, session) in self.sessions.lock().unwrap().iter().filter(|(owner, _)| Some(**owner) != except) {
+            let _ = session.outbound.send(message.clone());
+        }
     }
 
     /// 把配过的手机端及是否在线告诉界面。
@@ -264,9 +394,14 @@ impl ServerContext {
     }
 }
 
-/// 在 TLS 上提供 WebSocket 服务（ADR-0014），每条连接各自握手，互不影响。
+/// 在 TLS 上提供 WebSocket 服务和发送文件的接口（ADR-0014、ADR-0021），每条连接各自握手，互不影响。
 pub async fn serve(listener: TcpListener, context: Arc<ServerContext>, tls: Arc<ServerConfig>) {
-    let router = Router::new().route("/ws", get(upgrade)).with_state(context);
+    let router = Router::new()
+        .route("/ws", get(upgrade))
+        // 上传的文件没有大小上限。
+        .route("/files", post(upload).layer(DefaultBodyLimit::disable()))
+        .route("/files/{offer_id}/{index}", get(download))
+        .with_state(context);
     let acceptor = TlsAcceptor::from(tls);
     loop {
         let (stream, address) = match listener.accept().await {
@@ -304,6 +439,57 @@ pub async fn serve(listener: TcpListener, context: Arc<ServerContext>, tls: Arc<
 
 async fn upgrade(socket: WebSocketUpgrade, State(context): State<Arc<ServerContext>>) -> Response {
     socket.on_upgrade(move |socket| session(socket, context))
+}
+
+/// 发送文件的请求在请求头里带着设备密钥（ADR-0021），认得这把密钥才处理。
+struct Paired(DeviceId);
+
+impl FromRequestParts<Arc<ServerContext>> for Paired {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(parts: &mut Parts, context: &Arc<ServerContext>) -> Result<Self, Self::Rejection> {
+        let key = parts.headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()?.strip_prefix("Bearer "));
+        let device = key.and_then(|key| context.pairing.lock().unwrap().device_for_key(key));
+        device.map(Self).ok_or(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// 手机端发来一批文件：边收边存进"下载"文件夹，收完以后放进电脑剪贴板；中途断开时已经存好的保留。
+async fn upload(State(context): State<Arc<ServerContext>>, _: Paired, multipart: Multipart) -> Result<StatusCode, StatusCode> {
+    let mut saved = Vec::new();
+    let received = save_uploaded(&context.downloads, multipart, &mut saved).await;
+    context.receive_files(&saved, received.is_ok());
+    received.map(|()| StatusCode::NO_CONTENT)
+}
+
+/// 把一个上传请求里的文件逐个存进 `dir`，存好一个就放进 `saved`。
+async fn save_uploaded(dir: &std::path::Path, mut multipart: Multipart, saved: &mut Vec<PathBuf>) -> Result<(), StatusCode> {
+    while let Some(field) = multipart.next_field().await.map_err(|err| err.status())? {
+        let name = field.file_name().unwrap_or_default().to_owned();
+        let path = files::save(dir, &name, field).await.map_err(|err| {
+            tracing::warn!("failed to receive a file: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        saved.push(path);
+    }
+    if saved.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+/// 手机端下载电脑端发来的清单里的一个文件。
+async fn download(
+    State(context): State<Arc<ServerContext>>,
+    Paired(device): Paired,
+    Path((offer_id, index)): Path<(String, u32)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let file = context.take_offered(&device, offer_id, index).ok_or(StatusCode::NOT_FOUND)?;
+    let (size, body) = file.body().await.map_err(|err| {
+        tracing::warn!("failed to read {}: {err}", file.name);
+        StatusCode::NOT_FOUND
+    })?;
+    Ok(([(header::CONTENT_LENGTH, size)], body))
 }
 
 async fn session(socket: WebSocket, context: Arc<ServerContext>) {
@@ -360,6 +546,7 @@ async fn session(socket: WebSocket, context: Arc<ServerContext>) {
                 device,
                 outbound: outbound.clone(),
                 close: close.clone(),
+                offered: HashMap::new(),
             },
         );
     }
@@ -605,6 +792,7 @@ fn dispatch(
             }
         }
         Body::ClipboardText(clipboard) => context.receive_clipboard(owner, clipboard),
+        Body::FileOfferResult(result) => context.file_offer_result(owner, result),
     }
 }
 
@@ -712,24 +900,37 @@ mod tests {
         }
     }
 
-    /// 记下写入的文字，读到的是最后写入的那条。
+    /// 记下写入的内容，读到的是最后写入的那条。
     #[derive(Default)]
-    struct RecordingClipboard(Mutex<Vec<String>>);
+    struct RecordingClipboard(Mutex<Vec<ClipboardContent>>);
 
     impl Clipboard for RecordingClipboard {
-        fn read(&self) -> Option<String> {
+        fn read(&self) -> Option<ClipboardContent> {
             self.0.lock().unwrap().last().cloned()
         }
 
         fn write(&self, text: &str) {
-            self.0.lock().unwrap().push(text.to_owned());
+            self.copy(ClipboardContent::Text(text.into()));
+        }
+
+        fn write_files(&self, files: &[PathBuf]) {
+            self.copy(ClipboardContent::Files(files.to_vec()));
         }
     }
 
     impl RecordingClipboard {
-        fn written(&self) -> Vec<String> {
+        /// 像用户在电脑上复制了这些内容。
+        fn copy(&self, content: ClipboardContent) {
+            self.0.lock().unwrap().push(content);
+        }
+
+        fn written(&self) -> Vec<ClipboardContent> {
             self.0.lock().unwrap().clone()
         }
+    }
+
+    fn text(text: &str) -> ClipboardContent {
+        ClipboardContent::Text(text.into())
     }
 
     struct UppercaseCleaner;
@@ -814,6 +1015,8 @@ mod tests {
         context: Arc<ServerContext>,
         input: Arc<RecordingInput>,
         clipboard: Arc<RecordingClipboard>,
+        downloads: PathBuf,
+        notifications: Arc<Mutex<Vec<String>>>,
         address: SocketAddr,
         certificate: CertificateDer<'static>,
     }
@@ -825,16 +1028,18 @@ mod tests {
         let host = IpAddr::from(Ipv4Addr::LOCALHOST);
         let input = Arc::new(RecordingInput::default());
         let clipboard = Arc::new(RecordingClipboard::default());
+        let downloads = dir.join("Downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let notifications = Arc::new(Mutex::new(Vec::new()));
         let status = Arc::new(StatusHub::new(|_| {}));
-        let context = Arc::new(ServerContext::new(
-            "Test Mac".into(),
-            host,
-            certificate.fingerprint(),
-            pairing,
-            status,
-            input.clone(),
-            clipboard.clone(),
-        ));
+        let notified = notifications.clone();
+        let system = System {
+            input: input.clone(),
+            clipboard: clipboard.clone(),
+            downloads: downloads.clone(),
+            notify: Box::new(move |message| notified.lock().unwrap().push(message)),
+        };
+        let context = Arc::new(ServerContext::new("Test Mac".into(), host, certificate.fingerprint(), pairing, status, system));
         context.set_dictation(dictation);
         context.set_clipboard(&ClipboardSettings::default());
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -844,6 +1049,8 @@ mod tests {
             context,
             input,
             clipboard,
+            downloads,
+            notifications,
             address,
             certificate: certificate.der().clone(),
         }
@@ -854,16 +1061,20 @@ mod tests {
             self.context.pairing.lock().unwrap().pairing_token().to_owned()
         }
 
-        /// 像手机端一样建立加密连接：只认这台电脑端的证书。
-        async fn open(&self) -> Client {
-            let config = ClientConfig::builder_with_provider(Arc::new(provider()))
+        /// 像手机端一样只认这台电脑端的证书。
+        fn tls_config(&self) -> ClientConfig {
+            ClientConfig::builder_with_provider(Arc::new(provider()))
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(PinnedCertificate(self.certificate.clone())))
-                .with_no_client_auth();
+                .with_no_client_auth()
+        }
+
+        /// 像手机端一样建立加密连接。
+        async fn open(&self) -> Client {
             let tcp = TcpStream::connect(self.address).await.unwrap();
-            let tls = TlsConnector::from(Arc::new(config))
+            let tls = TlsConnector::from(Arc::new(self.tls_config()))
                 .connect(ServerName::try_from(CERTIFICATE_NAME).unwrap(), tcp)
                 .await
                 .unwrap();
@@ -902,6 +1113,58 @@ mod tests {
             (client, device_key)
         }
 
+        /// 像手机端一样发 HTTPS 请求，`device_key` 放进请求头。
+        fn request(&self, method: reqwest::Method, path: &str, device_key: Option<&str>) -> reqwest::RequestBuilder {
+            let client = reqwest::Client::builder()
+                .tls_backend_preconfigured(self.tls_config())
+                .resolve(CERTIFICATE_NAME, self.address)
+                .no_proxy()
+                .build()
+                .unwrap();
+            let request = client.request(method, format!("https://{CERTIFICATE_NAME}:{}{path}", self.address.port()));
+            match device_key {
+                Some(key) => request.bearer_auth(key),
+                None => request,
+            }
+        }
+
+        /// 像手机端一样把一批文件放进一个上传请求：文件名按 UTF-8 原样放进引号里，引号前加反斜杠。
+        async fn upload(&self, device_key: Option<&str>, files: &[(&str, &str)]) -> reqwest::StatusCode {
+            self.upload_body(device_key, multipart_parts(files) + &format!("--{BOUNDARY}--\r\n")).await
+        }
+
+        async fn upload_body(&self, device_key: Option<&str>, body: String) -> reqwest::StatusCode {
+            let request = self.request(reqwest::Method::POST, "/files", device_key);
+            let request = request.header(reqwest::header::CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"));
+            request.body(body).send().await.unwrap().status()
+        }
+
+        /// 下载清单里的一个文件，返回状态和内容。
+        async fn download(&self, device_key: &str, offer_id: &str, index: u32) -> (reqwest::StatusCode, String) {
+            let response = self.request(reqwest::Method::GET, &format!("/files/{offer_id}/{index}"), Some(device_key)).send().await.unwrap();
+            (response.status(), response.text().await.unwrap())
+        }
+
+        fn notifications(&self) -> Vec<String> {
+            self.notifications.lock().unwrap().clone()
+        }
+
+        /// 用户主动同步给手机端 `phone_id`，剪贴板里应该是文字或者发不出去。
+        fn sync_clipboard(&self, phone_id: &str) -> SyncResult {
+            match self.context.sync_clipboard(phone_id) {
+                ClipboardSync::Done(result) => result,
+                ClipboardSync::Confirm(pending) => panic!("unexpected confirmation: {}", pending.question()),
+            }
+        }
+
+        /// 用户主动同步给手机端 `phone_id`，剪贴板里应该是要确认的文件。
+        fn pending_files(&self, phone_id: &str) -> PendingFiles {
+            match self.context.sync_clipboard(phone_id) {
+                ClipboardSync::Confirm(pending) => pending,
+                ClipboardSync::Done(result) => panic!("expected a confirmation, got {result:?}"),
+            }
+        }
+
         /// 等电脑端界面上的手机端列表变成预期的样子。
         async fn wait_for_phones(&self, expected: &[(&str, bool)]) {
             for _ in 0..100 {
@@ -936,6 +1199,18 @@ mod tests {
             }
             panic!("the expected input never arrived: {:?}", self.input.commands());
         }
+    }
+
+    const BOUNDARY: &str = "echopad-boundary";
+
+    /// 上传请求里的这些文件，不带结尾的分隔线。
+    fn multipart_parts(files: &[(&str, &str)]) -> String {
+        let mut body = String::new();
+        for (name, contents) in files {
+            let name = name.replace('"', "\\\"");
+            body += &format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\r\n{contents}\r\n");
+        }
+        body
     }
 
     async fn send(client: &mut Client, body: client_message::Body) {
@@ -984,7 +1259,7 @@ mod tests {
         let copied = clipboard("hello", later(1_000));
         send_clipboard(&mut sender, &copied).await;
         assert_eq!(receive(&mut other).await, server_message::Body::ClipboardText(copied));
-        assert_eq!(harness.clipboard.written(), ["hello"]);
+        assert_eq!(harness.clipboard.written(), [text("hello")]);
         assert_nothing_received(&mut sender).await;
     }
 
@@ -1001,7 +1276,7 @@ mod tests {
         send_clipboard(&mut second, &copied).await;
         send_clipboard(&mut second, &clipboard("older", later(500))).await;
         harness.wait_until_handled(&mut second).await;
-        assert_eq!(harness.clipboard.written(), ["hello"]);
+        assert_eq!(harness.clipboard.written(), [text("hello")]);
         assert_nothing_received(&mut first).await;
     }
 
@@ -1016,7 +1291,7 @@ mod tests {
         send_clipboard(&mut second, &clipboard("older", later(1_000))).await;
         harness.wait_until_handled(&mut first).await;
         harness.wait_until_handled(&mut second).await;
-        assert_eq!(harness.clipboard.written().last().map(String::as_str), Some("newer"));
+        assert_eq!(harness.clipboard.written().last(), Some(&text("newer")));
         assert_eq!(receive(&mut second).await, server_message::Body::ClipboardText(newer));
     }
 
@@ -1051,7 +1326,7 @@ mod tests {
 
         let mut sent = Vec::new();
         for _ in 0..2 {
-            assert_eq!(harness.context.sync_clipboard(), SyncResult::Sent(vec!["Phone phone-1".into()]));
+            assert_eq!(harness.sync_clipboard("phone-1"), SyncResult::TextSent("Phone phone-1".into()));
             let server_message::Body::ClipboardText(copied) = receive(&mut client).await else {
                 panic!("expected the clipboard");
             };
@@ -1059,6 +1334,43 @@ mod tests {
             sent.push(copied.updated_at);
         }
         assert!(sent[1] > sent[0]);
+    }
+
+    #[tokio::test]
+    async fn syncing_and_sending_on_purpose_only_reach_the_chosen_phone() {
+        let harness = start_server(None).await;
+        let (mut chosen, _) = harness.pair("phone-1").await;
+        let (mut other, _) = harness.pair("phone-2").await;
+
+        harness.clipboard.write("on the desktop");
+        assert_eq!(harness.sync_clipboard("phone-1"), SyncResult::TextSent("Phone phone-1".into()));
+        assert!(matches!(receive(&mut chosen).await, server_message::Body::ClipboardText(_)));
+        harness.clipboard.copy(ClipboardContent::Image(b"png".to_vec()));
+        let pending = harness.pending_files("phone-1");
+        assert_eq!(pending.question(), "把 1 个文件（3 字节）发送到 Phone phone-1？");
+        harness.context.send_files("phone-1", pending.files);
+        assert!(matches!(receive(&mut chosen).await, server_message::Body::FileOffer(_)));
+        assert_nothing_received(&mut other).await;
+
+        drop(other);
+        harness.wait_for_phones(&[("Phone phone-1", true), ("Phone phone-2", false)]).await;
+        assert_eq!(harness.sync_clipboard("phone-2"), SyncResult::PhoneOffline);
+    }
+
+    #[tokio::test]
+    async fn typed_text_reaches_only_the_chosen_phone_and_leaves_the_desktop_clipboard_alone() {
+        let harness = start_server(None).await;
+        let (mut chosen, _) = harness.pair("phone-1").await;
+        let (mut other, _) = harness.pair("phone-2").await;
+
+        assert_eq!(harness.context.send_text("phone-1", "typed".into()), SyncResult::TextSent("Phone phone-1".into()));
+        let server_message::Body::ClipboardText(sent) = receive(&mut chosen).await else {
+            panic!("expected the clipboard");
+        };
+        assert_eq!(sent.text, "typed");
+        assert_nothing_received(&mut other).await;
+        assert!(harness.clipboard.written().is_empty());
+        assert_eq!(harness.context.send_text("phone-3", "typed".into()), SyncResult::PhoneOffline);
     }
 
     #[tokio::test]
@@ -1080,6 +1392,137 @@ mod tests {
         send_clipboard(&mut sender, &copied).await;
         assert_eq!(receive(&mut other).await, server_message::Body::ClipboardText(copied));
         assert!(harness.clipboard.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn files_from_a_paired_phone_are_saved_and_copied() {
+        let harness = start_server(None).await;
+        let (_client, device_key) = harness.pair("phone-1").await;
+        std::fs::write(harness.downloads.join("照片.jpg"), "already there").unwrap();
+
+        let status = harness.upload(Some(&device_key), &[("照片.jpg", "jpeg"), ("报告 \"终版\".pdf", "pdf")]).await;
+
+        assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+        let saved = vec![harness.downloads.join("照片 (1).jpg"), harness.downloads.join("报告 \"终版\".pdf")];
+        assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), "jpeg");
+        assert_eq!(std::fs::read_to_string(&saved[1]).unwrap(), "pdf");
+        assert_eq!(harness.clipboard.written(), [ClipboardContent::Files(saved)]);
+        assert_eq!(harness.notifications(), ["收到 2 个文件，已复制到剪贴板"]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_upload_keeps_the_finished_files_and_says_so() {
+        let harness = start_server(None).await;
+        let (_client, device_key) = harness.pair("phone-1").await;
+
+        // 第二个文件传到一半连接断了：请求里没有它的结尾和结尾的分隔线。
+        let mut body = multipart_parts(&[("a.txt", "done")]);
+        body += &format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.txt\"\r\n\r\nhal");
+        assert!(!harness.upload_body(Some(&device_key), body).await.is_success());
+
+        let saved: Vec<_> = std::fs::read_dir(&harness.downloads).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(saved, ["a.txt"]);
+        assert!(harness.clipboard.written().is_empty());
+        assert_eq!(harness.notifications(), ["接收中断，已保存 1 个文件"]);
+    }
+
+    #[tokio::test]
+    async fn the_phone_reports_how_an_offer_ended() {
+        let harness = start_server(None).await;
+        let (mut client, device_key) = harness.pair("phone-1").await;
+        let mut offer_ids = Vec::new();
+        for _ in 0..4 {
+            harness.clipboard.copy(ClipboardContent::Image(b"png".to_vec()));
+            harness.context.send_files("phone-1", harness.pending_files("phone-1").files);
+            let server_message::Body::FileOffer(offer) = receive(&mut client).await else {
+                panic!("expected a file offer");
+            };
+            offer_ids.push(offer.offer_id);
+        }
+        use file_offer_result::Outcome;
+        let outcomes = [(Outcome::Saved, 1), (Outcome::Failed, 0), (Outcome::Unsupported, 0), (Outcome::Cancelled, 0)];
+        for (offer_id, (outcome, saved)) in offer_ids.iter().zip(outcomes) {
+            let result = FileOfferResult { offer_id: offer_id.clone(), outcome: outcome.into(), saved };
+            send(&mut client, client_message::Body::FileOfferResult(result)).await;
+        }
+        harness.wait_until_handled(&mut client).await;
+
+        // 用户在手机上取消的不提示。
+        assert_eq!(
+            harness.notifications(),
+            ["Phone phone-1 已保存 1 个文件", "Phone phone-1 没能接收文件", "Phone phone-1 的系统版本太低，不能接收文件"]
+        );
+        // 不论结果如何，清单都随之作废，剩下的文件不能再下载。
+        assert_eq!(harness.download(&device_key, &offer_ids[3], 0).await.0, reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn uploads_without_a_paired_device_key_are_rejected() {
+        let harness = start_server(None).await;
+        let (_client, device_key) = harness.pair("phone-1").await;
+        harness.context.unpair("phone-1").unwrap();
+
+        for key in [None, Some("not a device key"), Some(device_key.as_str())] {
+            assert_eq!(harness.upload(key, &[("a.txt", "a")]).await, reqwest::StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(std::fs::read_dir(&harness.downloads).unwrap().count(), 0);
+        assert!(harness.clipboard.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn files_copied_on_the_desktop_are_offered_and_downloaded_once() {
+        let harness = start_server(None).await;
+        let (mut client, device_key) = harness.pair("phone-1").await;
+        let copied = harness.downloads.join("a.txt");
+        std::fs::write(&copied, "hello").unwrap();
+        harness.clipboard.copy(ClipboardContent::Files(vec![harness.downloads.clone(), copied]));
+
+        let pending = harness.pending_files("phone-1");
+        assert_eq!(pending.question(), "把 1 个文件（5 字节）发送到 Phone phone-1？");
+        assert_eq!(harness.context.send_files("phone-1", pending.files), SyncResult::FilesSending("Phone phone-1".into()));
+
+        let server_message::Body::FileOffer(offer) = receive(&mut client).await else {
+            panic!("expected a file offer");
+        };
+        assert_eq!(offer.files, [protocol::OfferedFile { name: "a.txt".into(), size: 5 }]);
+        assert_eq!(harness.download(&device_key, &offer.offer_id, 0).await, (reqwest::StatusCode::OK, "hello".into()));
+        assert_eq!(harness.download(&device_key, &offer.offer_id, 0).await.0, reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_offer_is_only_for_its_phone_until_it_disconnects() {
+        let harness = start_server(None).await;
+        let (mut client, device_key) = harness.pair("phone-1").await;
+        harness.clipboard.copy(ClipboardContent::Image(b"png".to_vec()));
+        let pending = harness.pending_files("phone-1");
+        assert_eq!(pending.files[0].name, "图片.png");
+        harness.context.send_files("phone-1", pending.files);
+        let server_message::Body::FileOffer(offer) = receive(&mut client).await else {
+            panic!("expected a file offer");
+        };
+
+        // 之后才连上的手机端拿不到这份清单里的文件。
+        let (_other, other_key) = harness.pair("phone-2").await;
+        assert_eq!(harness.download(&other_key, &offer.offer_id, 0).await.0, reqwest::StatusCode::NOT_FOUND);
+
+        drop(client);
+        harness.wait_for_phones(&[("Phone phone-1", false), ("Phone phone-2", true)]).await;
+        assert_eq!(harness.download(&device_key, &offer.offer_id, 0).await.0, reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn files_are_not_sent_without_an_online_phone_or_as_folders() {
+        let harness = start_server(None).await;
+        let copied = harness.downloads.join("a.txt");
+        std::fs::write(&copied, "hello").unwrap();
+        harness.clipboard.copy(ClipboardContent::Files(vec![copied]));
+        assert_eq!(harness.sync_clipboard("phone-1"), SyncResult::PhoneOffline);
+
+        let _client = paired_client(&harness).await;
+        harness.clipboard.copy(ClipboardContent::Files(vec![harness.downloads.clone()]));
+        assert_eq!(harness.sync_clipboard("phone-1"), SyncResult::OnlyFolders);
+        harness.clipboard.copy(ClipboardContent::Files(vec![harness.downloads.join("ejected.txt")]));
+        assert_eq!(harness.sync_clipboard("phone-1"), SyncResult::FilesUnreadable);
     }
 
     #[tokio::test]

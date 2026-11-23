@@ -2,9 +2,10 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { ChevronLeftIcon, ClipboardPasteIcon, PlusIcon, SettingsIcon, SmartphoneIcon } from "lucide-react";
+import { ChevronLeftIcon, ClipboardIcon, FileIcon, PlusIcon, SettingsIcon, SmartphoneIcon, TypeIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { SendTextDialog } from "./SendTextDialog";
 import { SettingsPage } from "./SettingsPage";
 import { UpdateDialog } from "./UpdateDialog";
 import { useUpdateStatus } from "./update";
@@ -23,12 +24,7 @@ type Status = {
   clipboardAccessDenied: boolean;
 };
 
-function connectionLabel(online: number, outdated: Status["outdated"]): string {
-  if (online > 0) return `${online} 部手机在线`;
-  if (outdated === "mobile") return "手机端需要更新";
-  if (outdated === "desktop") return "电脑端需要更新";
-  return "没有手机在线";
-}
+const OUTDATED_LABELS = { mobile: "手机端需要更新", desktop: "电脑端需要更新" } as const;
 
 function App() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -36,6 +32,19 @@ function App() {
   const pairedCount = useRef(0);
   const update = useUpdateStatus();
   const [updateOpen, setUpdateOpen] = useState(false);
+  /** 正在给哪部手机打要发送的字。 */
+  const [sendingTextTo, setSendingTextTo] = useState<Phone | null>(null);
+
+  // 菜单栏菜单里的"发送文本到 某某…"打开主窗口，在这里弹输入框。
+  useEffect(() => {
+    const unlisten = listen<string>("send-text", (event) => {
+      setPage("status");
+      invoke<Status>("get_status").then((status) => setSendingTextTo(status.phones.find((phone) => phone.id === event.payload) ?? null));
+    });
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, []);
 
   useEffect(() => {
     const unlisten = listen<Status>("status-changed", (event) => setStatus(event.payload));
@@ -86,6 +95,58 @@ function App() {
   }
 
   const online = status.phones.filter((phone) => phone.online).length;
+  // 状态列表只列出要处理的事，全都正常时不显示（DESIGN.md）；手机在不在线看列表里的圆点。
+  const issues = [
+    online === 0 && status.outdated && (
+      <StatusRow key="outdated" ok={false}>
+        {OUTDATED_LABELS[status.outdated]}
+      </StatusRow>
+    ),
+    status.inputPermission === false && (
+      <StatusRow
+        key="input"
+        ok={false}
+        action={
+          <Button variant="outline" size="xs" onClick={() => invoke("open_privacy_settings", { pane: "accessibility" })}>
+            打开系统设置
+          </Button>
+        }
+      >
+        需要允许辅助功能
+      </StatusRow>
+    ),
+    !status.dictationReady && (
+      <StatusRow key="dictation" ok={false}>
+        语音输入未配置
+      </StatusRow>
+    ),
+    status.clipboardAccessDenied && (
+      <StatusRow
+        key="clipboard"
+        ok={false}
+        action={
+          <Button variant="outline" size="xs" onClick={() => invoke("open_privacy_settings", { pane: "pasteboard" })}>
+            打开系统设置
+          </Button>
+        }
+      >
+        需要允许读取剪贴板
+      </StatusRow>
+    ),
+    update.prompt && (
+      <StatusRow
+        key="update"
+        ok
+        action={
+          <Button variant="outline" size="xs" onClick={() => setUpdateOpen(true)}>
+            更新
+          </Button>
+        }
+      >
+        新版本 {update.availableVersion} 可用
+      </StatusRow>
+    ),
+  ].filter(Boolean);
 
   return (
     <>
@@ -94,75 +155,19 @@ function App() {
           <PairingCode status={status} />
         ) : (
           <>
-            <ul className="w-full divide-y rounded-xl border bg-card text-sm">
+            <ul className="flex w-full flex-col gap-2 text-sm">
               {status.phones.map((phone) => (
-                <li key={phone.id} className="flex items-center gap-3 px-4 py-3">
-                  <SmartphoneIcon className="size-4 shrink-0 text-muted-foreground" />
-                  <span className={cn("flex-1 truncate", !phone.online && "text-muted-foreground")}>{phone.name}</span>
-                  <span
-                    className={cn("size-2 shrink-0 rounded-full", phone.online ? "bg-green-600" : "bg-muted-foreground/40")}
-                  />
-                  <Button variant="outline" size="xs" onClick={() => invoke("unpair_phone", { id: phone.id })}>
-                    取消配对
-                  </Button>
-                </li>
+                <PhoneCard key={phone.id} phone={phone} onSendText={() => setSendingTextTo(phone)} />
               ))}
             </ul>
-            <div className="mt-2 flex gap-2 self-start">
-              <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setPage("pairing")}>
-                <PlusIcon />
-                配对新手机
-              </Button>
-              {online > 0 && (
-                <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => invoke<string>("sync_clipboard").then((message) => toast(message))}>
-                  <ClipboardPasteIcon />
-                  同步剪贴板
-                </Button>
-              )}
-            </div>
+            <Button variant="ghost" size="sm" className="mt-2 self-start text-muted-foreground" onClick={() => setPage("pairing")}>
+              <PlusIcon />
+              配对新手机
+            </Button>
           </>
         )}
 
-        <ul className="mt-8 w-full divide-y rounded-xl border bg-card text-sm">
-          <StatusRow ok={online > 0}>{connectionLabel(online, status.outdated)}</StatusRow>
-          <StatusRow
-            ok={status.inputPermission === true}
-            action={
-              status.inputPermission === false && (
-                <Button variant="outline" size="xs" onClick={() => invoke("open_privacy_settings", { pane: "accessibility" })}>
-                  打开系统设置
-                </Button>
-              )
-            }
-          >
-            {status.inputPermission === false ? "需要允许辅助功能" : "可以控制指针"}
-          </StatusRow>
-          <StatusRow ok={status.dictationReady}>{status.dictationReady ? "语音输入可用" : "语音输入未配置"}</StatusRow>
-          {status.clipboardAccessDenied && (
-            <StatusRow
-              ok={false}
-              action={
-                <Button variant="outline" size="xs" onClick={() => invoke("open_privacy_settings", { pane: "pasteboard" })}>
-                  打开系统设置
-                </Button>
-              }
-            >
-              需要允许读取剪贴板
-            </StatusRow>
-          )}
-          {update.prompt && (
-            <StatusRow
-              ok
-              action={
-                <Button variant="outline" size="xs" onClick={() => setUpdateOpen(true)}>
-                  更新
-                </Button>
-              }
-            >
-              新版本 {update.availableVersion} 可用
-            </StatusRow>
-          )}
-        </ul>
+        {issues.length > 0 && <ul className="mt-8 w-full divide-y rounded-xl border bg-card text-sm">{issues}</ul>}
 
         <Button variant="ghost" size="sm" className="mt-auto text-muted-foreground" onClick={() => setPage("settings")}>
           <SettingsIcon />
@@ -170,6 +175,7 @@ function App() {
         </Button>
       </main>
       {updateDialog}
+      <SendTextDialog phone={sendingTextTo} onClose={() => setSendingTextTo(null)} />
     </>
   );
 }
@@ -183,6 +189,51 @@ function PairingCode({ status }: { status: Status }) {
       />
       <p className="mt-4 text-sm text-muted-foreground">用 EchoPad 手机端扫码配对</p>
     </>
+  );
+}
+
+/** 手机卡片上的按钮：图标在上、文字在下，用小字和次要色，不抢名称的风头；图标只表示内容，都是发给这部手机，不再画箭头。 */
+const PHONE_ACTION = "h-auto flex-col gap-1 py-2.5 text-xs font-normal text-muted-foreground hover:text-foreground";
+
+/**
+ * 一部配过的手机：名称和在线状态；在线时下面是只发给它的"发送剪贴板""发送文件"和"发送文本"
+ * （DESIGN.md、docs/prd/clipboard-sync.md、docs/prd/send-files.md）。
+ */
+function PhoneCard({ phone, onSendText }: { phone: Phone; onSendText: () => void }) {
+  const run = (command: "sync_clipboard" | "send_files") =>
+    invoke<string | null>(command, { phoneId: phone.id }).then((message) => message && toast(message));
+  return (
+    <li className="rounded-xl border bg-card p-3">
+      <div className="flex items-center gap-3">
+        <SmartphoneIcon className="size-5 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <p className={cn("truncate", !phone.online && "text-muted-foreground")}>{phone.name}</p>
+          <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className={cn("size-1.5 rounded-full", phone.online ? "bg-green-600" : "bg-muted-foreground/40")} />
+            {phone.online ? "在线" : "离线"}
+          </p>
+        </div>
+        <Button variant="ghost" size="xs" className="text-muted-foreground" onClick={() => invoke("unpair_phone", { id: phone.id })}>
+          取消配对
+        </Button>
+      </div>
+      {phone.online && (
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <Button variant="secondary" className={PHONE_ACTION} onClick={() => run("sync_clipboard")}>
+            <ClipboardIcon />
+            发送剪贴板
+          </Button>
+          <Button variant="secondary" className={PHONE_ACTION} onClick={() => run("send_files")}>
+            <FileIcon />
+            发送文件
+          </Button>
+          <Button variant="secondary" className={PHONE_ACTION} onClick={onSendText}>
+            <TypeIcon />
+            发送文本
+          </Button>
+        </div>
+      )}
+    </li>
   );
 }
 
