@@ -14,7 +14,7 @@
 | `desktop/` | 电脑端：执行手机端发来的操作、模拟键鼠、把声音转发给识别服务 | Tauri 2（Rust）+ React + TypeScript |
 | `mobile/` | 手机端 App，先做 Android，后续可加 iOS | Kotlin Multiplatform + Compose Multiplatform |
 
-应用标识：电脑端 `com.wbbb.echopad.desktop`，手机端 `com.wbbb.echopad.mobile`（debug 构建是 `com.wbbb.echopad.mobile.debug`）。
+应用标识：电脑端 `com.wbbb.echopad.desktop`（测试包是 `com.wbbb.echopad.desktop.dev`），手机端 `com.wbbb.echopad.mobile`（debug 构建是 `com.wbbb.echopad.mobile.debug`）。两端的测试包都显示为 `EchoPad Dev`。
 
 ## 电脑端
 
@@ -23,12 +23,12 @@
 ```bash
 cd desktop
 pnpm install
-pnpm tauri dev
+pnpm start
 ```
 
-第一次运行时 macOS 会请求"辅助功能"权限，授权后电脑端才能控制指针和输入文字。
+`pnpm start` 运行的是测试包 `EchoPad Dev`：有自己的设置、配对和端口（47322），可以和正式版同时运行；它和打包装好的 `EchoPad Dev.app` 是同一个应用，两者不能同时运行。第一次运行时 macOS 会请求"辅助功能"权限，授权后电脑端才能控制指针和输入文字。
 
-语音输入需要用户自己的密钥（ADR-0007），在电脑端的"设置"里选择服务并填写。密钥和其他设置一起保存在 `~/Library/Application Support/com.wbbb.echopad.desktop/settings.json`，只有当前用户可以读写。不填时其他功能照常可用。
+语音输入需要用户自己的密钥（ADR-0007），在电脑端的"设置"里选择服务并填写。密钥和其他设置一起保存在 `~/Library/Application Support/com.wbbb.echopad.desktop/settings.json`（测试包在 `com.wbbb.echopad.desktop.dev` 下），只有当前用户可以读写。不填时其他功能照常可用。
 
 | 服务 | 获取密钥 |
 |---|---|
@@ -44,11 +44,11 @@ cd desktop/src-tauri
 cargo test
 ```
 
-打包 macOS 应用：用 `APPLE_SIGNING_IDENTITY` 指定本机钥匙串里的签名证书（例如 `Developer ID Application: …`），产物在 `desktop/src-tauri/target/release/bundle/macos/`。签名不变时，更新后不用重新授权辅助功能。
+打包 macOS 测试包（`EchoPad Dev.app`）：用 `APPLE_SIGNING_IDENTITY` 指定本机钥匙串里的签名证书（例如 `Developer ID Application: …`），产物在 `desktop/src-tauri/target/release/bundle/macos/EchoPad Dev.app`。测试包可以和正式版 `EchoPad.app` 共存并同时运行，在手机端显示为 `… (Dev)`；签名不变时，更新后不用重新授权辅助功能。
 
 ```bash
 cd desktop
-APPLE_SIGNING_IDENTITY="Developer ID Application: …" pnpm tauri build --bundles app
+APPLE_SIGNING_IDENTITY="Developer ID Application: …" pnpm build:dev
 ```
 
 macOS 26 起使用的应用图标，源文件是 `desktop/src-tauri/icons/AppIcon.icon`（Icon Composer 文档）。Tauri 打包时编译它会失败（[tauri-apps/tauri#16386](https://github.com/tauri-apps/tauri/issues/16386)），所以打包用的是预先编译好的 `icons/Assets.car`。改了图标后需要用 Xcode 26 以上重新生成；如果报 "Bad file descriptor"，先结束 `ibtoold` 进程再试：
@@ -68,7 +68,7 @@ cd mobile
 ./gradlew :androidApp:installDebug
 ```
 
-debug 构建的包名带 `.debug` 后缀，桌面上显示为"EchoPad Debug"，可以和发版的正式版同时安装。
+debug 构建的包名带 `.debug` 后缀，桌面上显示为"EchoPad Dev"，可以和发版的正式版同时安装。
 
 测试：
 
@@ -107,5 +107,5 @@ GitHub Actions 看到标签后检查两端、打包，全部成功后发到 GitH
 
 ## 调试
 
-- 电脑端的详细日志：用 `RUST_LOG=desktop_lib=debug pnpm tauri dev` 启动，日志里会打印当前的配对链接；换成 `trace` 还会打印每条键鼠命令。
-- 在模拟器里配对：没有摄像头时，可以用 adb 打开日志里的配对链接代替扫码，例如 `adb shell am start -a android.intent.action.VIEW -d '"echopad://pair?host=…&port=47321&token=…"'`。
+- 电脑端的详细日志：用 `RUST_LOG=desktop_lib=debug pnpm start` 启动，日志里会打印当前的配对链接；换成 `trace` 还会打印每条键鼠命令。
+- 在模拟器里配对：没有摄像头时，可以用 adb 打开日志里的配对链接代替扫码，例如 `adb shell am start -a android.intent.action.VIEW -d '"echopad://pair?host=…&port=47322&token=…"'`。

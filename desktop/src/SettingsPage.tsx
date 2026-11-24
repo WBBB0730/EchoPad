@@ -109,8 +109,8 @@ export function SettingsPage({
   }
 
   return (
-    <main className="flex h-screen flex-col">
-      <header className="flex items-center gap-1 px-4 pt-4 pb-2">
+    <main className="flex min-h-0 flex-1 flex-col">
+      <header className="flex items-center gap-1 px-4 pt-1 pb-2">
         <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="返回">
           <ChevronLeftIcon />
         </Button>

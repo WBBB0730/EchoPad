@@ -4,7 +4,7 @@ Durable project knowledge not captured elsewhere.
 
 ## User-Requested
 
-- **改完就打包并装上**：每次改完代码，电脑端有改动就重新打包，替换 `/Applications/EchoPad.app` 并重新打开；手机端有改动就重新打安卓 APK 并装到用户自己的手机上，不装模拟器。不用等用户提醒。
+- **改完就打包并装上**：每次改完代码，电脑端有改动就重新打测试包（`EchoPad Dev`），替换 `/Applications/EchoPad Dev.app` 并重新打开；手机端有改动就重新打安卓 APK 并装到用户自己的手机上，不装模拟器。不用等用户提醒。
 
 ## Verified Learnings
 

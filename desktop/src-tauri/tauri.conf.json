@@ -14,7 +14,9 @@
       {
         "title": "EchoPad",
         "width": 380,
-        "height": 600
+        "height": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

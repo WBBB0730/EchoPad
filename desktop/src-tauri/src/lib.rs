@@ -21,7 +21,7 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tauri::{
-    AppHandle, Emitter, Manager, RunEvent, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, WebviewWindow, WindowEvent,
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -36,12 +36,11 @@ use tokio_rustls::rustls::ServerConfig;
 
 use crate::{
     certificate::DesktopCertificate,
-    clipboard::{SyncResult, SystemClipboard},
+    clipboard::SystemClipboard,
     dictation::{CloudDictation, DictationService},
-    files::OutgoingFile,
     input::InputController,
     pairing::PairingStore,
-    server::{ClipboardSync, PORT, ServerContext, System},
+    server::{DEV_PORT, PORT, SendPlan, ServerContext, System},
     settings::{CleanupModel, CleanupPreset, Credential, DoubaoResource, RecognitionService, Settings, SettingsStore},
     status::{PhoneStatus, Status, StatusHub},
     update::{UpdateStatus, Updater},
@@ -147,25 +146,46 @@ fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Resul
 
 /// 主窗口里一部手机的"发送剪贴板"，返回给用户的提示；用户取消发送文件时为 `None`。
 #[tauri::command]
-async fn sync_clipboard(app: AppHandle, phone_id: String) -> Option<String> {
-    confirm_and_sync_clipboard(app, phone_id).await
+async fn sync_clipboard(app: AppHandle, window: WebviewWindow, phone_id: String) -> Option<String> {
+    confirm_and_sync_clipboard(app, phone_id, Some(window)).await
 }
 
 /// 菜单栏菜单和主窗口里一部手机的"发送剪贴板"：剪贴板里是文件或图片时，先用系统对话框问用户
 /// （DESIGN.md、docs/prd/send-files.md）。返回给用户的提示，用户取消时为 `None`。
-async fn confirm_and_sync_clipboard(app: AppHandle, phone_id: String) -> Option<String> {
-    let server = app.state::<AppState>().server.clone();
-    let pending = match server.sync_clipboard(&phone_id) {
-        ClipboardSync::Done(result) => return Some(result.message()),
-        ClipboardSync::Confirm(pending) => pending,
+async fn confirm_and_sync_clipboard(app: AppHandle, phone_id: String, window: Option<WebviewWindow>) -> Option<String> {
+    let plan = app.state::<AppState>().server.sync_clipboard(&phone_id);
+    confirm_and_send_files(app, phone_id, plan, window).await
+}
+
+/// 主窗口里拖进来的文件，发给指针下的那部手机（docs/prd/send-files.md）。返回给用户的提示，用户取消时为 `None`。
+#[tauri::command]
+async fn send_dropped_files(app: AppHandle, window: WebviewWindow, phone_id: String, paths: Vec<PathBuf>) -> Option<String> {
+    let plan = app.state::<AppState>().server.prepare_dropped_files(&phone_id, paths);
+    confirm_and_send_files(app, phone_id, plan, Some(window)).await
+}
+
+/// 要确认的发送（剪贴板里的文件或图片、拖进主窗口的文件）：先用系统对话框问用户，确认后再发
+/// （DESIGN.md、docs/prd/send-files.md）。从主窗口发起时，对话框挂在主窗口上。返回给用户的提示，用户取消时为 `None`。
+async fn confirm_and_send_files(app: AppHandle, phone_id: String, plan: SendPlan, window: Option<WebviewWindow>) -> Option<String> {
+    let pending = match plan {
+        SendPlan::Done(result) => return Some(result.message()),
+        SendPlan::Confirm(pending) => pending,
     };
     let (answer, answered) = oneshot::channel();
-    MessageDialogBuilder::new(app.dialog().clone(), pending.question(), "")
-        .buttons(MessageDialogButtons::OkCancelCustom("发送".into(), "取消".into()))
-        .show(move |confirmed| {
-            let _ = answer.send(confirmed);
-        });
-    answered.await.unwrap_or(false).then(|| server.send_files(&phone_id, pending.files).message())
+    let mut dialog = MessageDialogBuilder::new(app.dialog().clone(), pending.question(), "")
+        .buttons(MessageDialogButtons::OkCancelCustom("发送".into(), "取消".into()));
+    if let Some(window) = window {
+        // 从访达拖文件进来时，前台还是访达；先切到前台，对话框才接得到键盘。
+        let _ = window.set_focus();
+        dialog = dialog.parent(&window);
+    }
+    dialog.show(move |confirmed| {
+        let _ = answer.send(confirmed);
+    });
+    answered
+        .await
+        .unwrap_or(false)
+        .then(|| app.state::<AppState>().server.send_files(&phone_id, pending.files).message())
 }
 
 /// 主窗口里一部手机的"发送文件"，返回给用户的提示；用户没选文件时为 `None`。
@@ -182,14 +202,7 @@ async fn pick_and_send_files(app: AppHandle, phone_id: String) -> Option<String>
         let _ = answer.send(picked);
     });
     let paths: Vec<PathBuf> = answered.await.ok().flatten()?.into_iter().filter_map(|path| path.into_path().ok()).collect();
-    let result = match OutgoingFile::from_paths(paths) {
-        Ok(files) => app.state::<AppState>().server.send_files(&phone_id, files),
-        Err(err) => {
-            tracing::warn!("failed to read the picked files: {err}");
-            SyncResult::FilesUnreadable
-        }
-    };
-    Some(result.message())
+    Some(app.state::<AppState>().server.send_picked_files(&phone_id, paths).message())
 }
 
 /// 主窗口里一部手机的"发送文本"：把用户打的字发给这部手机，返回给用户的提示。
@@ -284,20 +297,26 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let dev = is_dev_app(app.handle());
+            let port = if dev { DEV_PORT } else { PORT };
+            // 窗口标题跟着应用名，测试包是 EchoPad Dev（窗口菜单和调度中心里看得到）。
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(&app.package_info().name);
+            }
             build_tray(app)?;
 
-            let updater = Arc::new(Updater::new(app.handle().clone()));
+            let updater = Arc::new(Updater::new(app.handle().clone(), !tauri::is_dev() && !dev));
             updater.clone().start();
             app.manage(updater);
 
-            let (state, tls) = build_state(app.handle())?;
+            let (state, tls) = build_state(app.handle(), port, dev)?;
             state.apply_settings();
             let server = state.server.clone();
             app.manage(state);
 
             // 广播失败（例如网络不允许组播）时，只是手机端无法自动找到换了地址的电脑，其他功能照常。
             let desktop_id = server.pairing.lock().unwrap().desktop_id().to_owned();
-            match discovery::advertise(&server.desktop_name, &desktop_id, PORT) {
+            match discovery::advertise(&server.desktop_name, &desktop_id, port) {
                 Ok(daemon) => {
                     let server = server.clone();
                     tauri::async_runtime::spawn(async move {
@@ -315,7 +334,7 @@ pub fn run() {
             }
 
             tauri::async_runtime::spawn(async move {
-                let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT));
+                let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
                 match tokio::net::TcpListener::bind(address).await {
                     Ok(listener) => server::serve(listener, server, tls).await,
                     Err(err) => tracing::error!("failed to start the connection server: {err}"),
@@ -337,6 +356,7 @@ pub fn run() {
             unpair_phone,
             sync_clipboard,
             send_files,
+            send_dropped_files,
             send_text,
             open_privacy_settings,
             get_update_status,
@@ -430,7 +450,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_ICON)
         .icon_as_template(true)
-        .tooltip("EchoPad")
+        .tooltip(&app.package_info().name)
         .menu(&tray_menu(app.handle(), &[])?)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -448,7 +468,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 if let Some(phone_id) = id.strip_prefix(SWITCH_MENU_PREFIX) {
                     app.state::<AppState>().server.request_switch(phone_id);
                 } else if let Some(phone_id) = id.strip_prefix(SYNC_CLIPBOARD_MENU_PREFIX) {
-                    notify_when_done(app, confirm_and_sync_clipboard(app.clone(), phone_id.into()));
+                    notify_when_done(app, confirm_and_sync_clipboard(app.clone(), phone_id.into(), None));
                 } else if let Some(phone_id) = id.strip_prefix(SEND_FILES_MENU_PREFIX) {
                     notify_when_done(app, pick_and_send_files(app.clone(), phone_id.into()));
                 } else if let Some(phone_id) = id.strip_prefix(SEND_TEXT_MENU_PREFIX) {
@@ -466,7 +486,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 /// （DESIGN.md）。
 fn tray_menu(app: &AppHandle, phones: &[PhoneStatus]) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
-    menu.append(&MenuItem::with_id(app, "open", "打开 EchoPad", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(app, "open", format!("打开 {}", app.package_info().name), true, None::<&str>)?)?;
     for phone in phones.iter().filter(|phone| phone.online) {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
         for (prefix, label) in [
@@ -515,8 +535,20 @@ fn hide_main_window(window: &tauri::Window) {
     let _ = window.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
 }
 
-/// 手机端显示的电脑名称：macOS 上用「系统设置 › 通用 › 关于本机」里的名称。
-fn desktop_name() -> String {
+/// 测试包（EchoPad Dev，用 `tauri.dev.conf.json` 打包或运行）：独立的包名让它有自己的配置目录，也就有自己的
+/// 电脑端标识、证书和配对；再配上独立的端口和设备名，就能和正式版同时运行。
+fn is_dev_app(app: &AppHandle) -> bool {
+    app.config().identifier.ends_with(".dev")
+}
+
+/// 手机端显示的电脑名称：macOS 上用「系统设置 › 通用 › 关于本机」里的名称；测试包加 `(Dev)` 后缀，
+/// 在手机端和正式版区分开，局域网广播也不重名。
+fn desktop_name(dev: bool) -> String {
+    let name = host_desktop_name();
+    if dev { format!("{name} (Dev)") } else { name }
+}
+
+fn host_desktop_name() -> String {
     #[cfg(target_os = "macos")]
     if let Some(name) =
         unsafe { objc2_system_configuration::SCDynamicStore::computer_name(None, std::ptr::null_mut()) }
@@ -526,7 +558,7 @@ fn desktop_name() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
-fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerConfig>)> {
+fn build_state(app: &tauri::AppHandle, port: u16, dev: bool) -> anyhow::Result<(AppState, Arc<ServerConfig>)> {
     let config_dir = app.path().app_config_dir()?;
     let certificate = DesktopCertificate::load_or_create(&config_dir)?;
     let pairing = PairingStore::load(config_dir.join("paired-devices.json"))?;
@@ -564,7 +596,7 @@ fn build_state(app: &tauri::AppHandle) -> anyhow::Result<(AppState, Arc<ServerCo
         downloads: app.path().download_dir()?,
         notify: Box::new(move |message| notify(&notifier, &message)),
     };
-    let server = Arc::new(ServerContext::new(desktop_name(), host, certificate.fingerprint(), pairing, status.clone(), system));
+    let server = Arc::new(ServerContext::new(desktop_name(dev), host, port, certificate.fingerprint(), pairing, status.clone(), system));
     let (enabled, copied) = (server.clone(), server.clone());
     clipboard.watch(
         move || enabled.clipboard_auto_send(),
@@ -612,6 +644,7 @@ mod tests {
             server: Arc::new(ServerContext::new(
                 "Mac".into(),
                 host,
+                PORT,
                 "fingerprint".into(),
                 pairing,
                 status,

@@ -69,7 +69,7 @@ struct State {
 
 pub struct Updater {
     app: AppHandle,
-    /// 开发版（`tauri dev`）不下载安装（同 DevCube ADR-0017）。
+    /// 开发版（`tauri dev` 和测试包 EchoPad Dev）不下载安装（同 DevCube ADR-0017）。
     installable: bool,
     state: Mutex<State>,
     /// 同一时间只做一次检查；并发的请求等它结束后直接返回结果。
@@ -77,10 +77,10 @@ pub struct Updater {
 }
 
 impl Updater {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(app: AppHandle, installable: bool) -> Self {
         Self {
             app,
-            installable: !tauri::is_dev(),
+            installable,
             state: Mutex::new(State { phase: UpdatePhase::UpToDate, available: None, downloaded: None, last_check: None }),
             checking: tokio::sync::Mutex::new(()),
         }

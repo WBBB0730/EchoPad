@@ -53,6 +53,8 @@ use crate::{
 };
 
 pub const PORT: u16 = 47321;
+/// 测试包（EchoPad Dev）用的端口，可以和正式版同时运行。
+pub const DEV_PORT: u16 = 47322;
 /// 电脑端的协议版本（ADR-0010）。
 pub const PROTOCOL_VERSION: u32 = protocol::ProtocolVersion::Current as u32;
 
@@ -77,10 +79,10 @@ pub struct System {
     pub notify: Box<dyn Fn(String) + Send + Sync>,
 }
 
-/// 用户在电脑端主动同步剪贴板。
-pub enum ClipboardSync {
+/// 电脑端一次主动发送的准备结果：直接结束（已发或出错），或者等用户确认后再发文件。
+pub enum SendPlan {
     Done(SyncResult),
-    /// 剪贴板里是文件或图片，等用户确认后再发（docs/prd/send-files.md）。
+    /// 剪贴板里的文件或图片、拖进主窗口的文件，等用户确认后再发（docs/prd/send-files.md）。
     Confirm(PendingFiles),
 }
 
@@ -88,6 +90,8 @@ pub struct ServerContext {
     pub desktop_name: String,
     /// 配对码里的局域网地址，电脑换了网络后会更新。
     host: Mutex<IpAddr>,
+    /// 本机监听的端口，写入配对码。
+    port: u16,
     /// 电脑端证书的指纹，放进配对码（ADR-0014）。
     fingerprint: String,
     pub pairing: Mutex<PairingStore>,
@@ -120,6 +124,7 @@ impl ServerContext {
     pub fn new(
         desktop_name: String,
         host: IpAddr,
+        port: u16,
         fingerprint: String,
         pairing: PairingStore,
         status: Arc<StatusHub>,
@@ -129,6 +134,7 @@ impl ServerContext {
         let context = Self {
             desktop_name,
             host: Mutex::new(host),
+            port,
             fingerprint,
             pairing: Mutex::new(pairing),
             status,
@@ -152,7 +158,7 @@ impl ServerContext {
         let pairing = self.pairing.lock().unwrap();
         pairing_link(
             *self.host.lock().unwrap(),
-            PORT,
+            self.port,
             pairing.pairing_token(),
             pairing.desktop_id(),
             &self.fingerprint,
@@ -219,24 +225,39 @@ impl ServerContext {
 
     /// 用户在电脑端主动同步给手机端 `phone_id`（主窗口、菜单栏菜单里这部手机的"发送剪贴板"）。剪贴板上是文字时发给它，
     /// 算一次新的复制，即使内容和现有的相同也照发，不受两个开关影响；是文件或图片时先交给用户确认（docs/prd/send-files.md）。
-    pub fn sync_clipboard(&self, phone_id: &str) -> ClipboardSync {
+    pub fn sync_clipboard(&self, phone_id: &str) -> SendPlan {
         let Some(phone) = self.phone(phone_id).filter(|phone| self.is_online(phone)) else {
-            return ClipboardSync::Done(SyncResult::PhoneOffline);
+            return SendPlan::Done(SyncResult::PhoneOffline);
         };
         let files = match self.clipboard.read() {
-            None => return ClipboardSync::Done(SyncResult::NoText),
-            Some(ClipboardContent::Text(text)) => return ClipboardSync::Done(self.sync_text(text, phone)),
+            None => return SendPlan::Done(SyncResult::NoText),
+            Some(ClipboardContent::Text(text)) => return SendPlan::Done(self.sync_text(text, phone)),
             Some(ClipboardContent::Image(png)) => vec![OutgoingFile::image(png)],
-            Some(ClipboardContent::Files(paths)) => match OutgoingFile::from_paths(paths) {
-                Ok(files) if files.is_empty() => return ClipboardSync::Done(SyncResult::OnlyFolders),
+            Some(ClipboardContent::Files(paths)) => match files_to_send(paths) {
                 Ok(files) => files,
-                Err(err) => {
-                    tracing::warn!("failed to read the copied files: {err}");
-                    return ClipboardSync::Done(SyncResult::FilesUnreadable);
-                }
+                Err(result) => return SendPlan::Done(result),
             },
         };
-        ClipboardSync::Confirm(PendingFiles { files, phone: phone.name })
+        SendPlan::Confirm(PendingFiles { files, phone: phone.name })
+    }
+
+    /// 用户把文件拖进主窗口，要发给手机端 `phone_id`：和剪贴板里的文件一样先交给用户确认（docs/prd/send-files.md）。
+    pub fn prepare_dropped_files(&self, phone_id: &str, paths: Vec<PathBuf>) -> SendPlan {
+        let Some(phone) = self.phone(phone_id).filter(|phone| self.is_online(phone)) else {
+            return SendPlan::Done(SyncResult::PhoneOffline);
+        };
+        match files_to_send(paths) {
+            Ok(files) => SendPlan::Confirm(PendingFiles { files, phone: phone.name }),
+            Err(result) => SendPlan::Done(result),
+        }
+    }
+
+    /// 用户在选文件面板里选好的文件，直接发给手机端 `phone_id`，不再确认（docs/prd/send-files.md）。
+    pub fn send_picked_files(&self, phone_id: &str, paths: Vec<PathBuf>) -> SyncResult {
+        match files_to_send(paths) {
+            Ok(files) => self.send_files(phone_id, files),
+            Err(result) => result,
+        }
     }
 
     /// 用户在电脑端给手机端 `phone_id` 发一段文字（主窗口、菜单栏菜单里这部手机的"发送文本"）：效果和在电脑上复制这段文字
@@ -391,6 +412,18 @@ impl ServerContext {
                 .collect()
         };
         self.status.set_phones(phones);
+    }
+}
+
+/// 要发给手机端的本地文件，跳过文件夹；全是文件夹或者读不了时，返回给用户的提示（docs/prd/send-files.md）。
+fn files_to_send(paths: Vec<PathBuf>) -> Result<Vec<OutgoingFile>, SyncResult> {
+    match OutgoingFile::from_paths(paths) {
+        Ok(files) if files.is_empty() => Err(SyncResult::OnlyFolders),
+        Ok(files) => Ok(files),
+        Err(err) => {
+            tracing::warn!("failed to read the files to send: {err}");
+            Err(SyncResult::FilesUnreadable)
+        }
     }
 }
 
@@ -1039,7 +1072,7 @@ mod tests {
             downloads: downloads.clone(),
             notify: Box::new(move |message| notified.lock().unwrap().push(message)),
         };
-        let context = Arc::new(ServerContext::new("Test Mac".into(), host, certificate.fingerprint(), pairing, status, system));
+        let context = Arc::new(ServerContext::new("Test Mac".into(), host, PORT, certificate.fingerprint(), pairing, status, system));
         context.set_dictation(dictation);
         context.set_clipboard(&ClipboardSettings::default());
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -1152,16 +1185,16 @@ mod tests {
         /// 用户主动同步给手机端 `phone_id`，剪贴板里应该是文字或者发不出去。
         fn sync_clipboard(&self, phone_id: &str) -> SyncResult {
             match self.context.sync_clipboard(phone_id) {
-                ClipboardSync::Done(result) => result,
-                ClipboardSync::Confirm(pending) => panic!("unexpected confirmation: {}", pending.question()),
+                SendPlan::Done(result) => result,
+                SendPlan::Confirm(pending) => panic!("unexpected confirmation: {}", pending.question()),
             }
         }
 
         /// 用户主动同步给手机端 `phone_id`，剪贴板里应该是要确认的文件。
         fn pending_files(&self, phone_id: &str) -> PendingFiles {
             match self.context.sync_clipboard(phone_id) {
-                ClipboardSync::Confirm(pending) => pending,
-                ClipboardSync::Done(result) => panic!("expected a confirmation, got {result:?}"),
+                SendPlan::Confirm(pending) => pending,
+                SendPlan::Done(result) => panic!("expected a confirmation, got {result:?}"),
             }
         }
 
@@ -1523,6 +1556,36 @@ mod tests {
         assert_eq!(harness.sync_clipboard("phone-1"), SyncResult::OnlyFolders);
         harness.clipboard.copy(ClipboardContent::Files(vec![harness.downloads.join("ejected.txt")]));
         assert_eq!(harness.sync_clipboard("phone-1"), SyncResult::FilesUnreadable);
+    }
+
+    #[tokio::test]
+    async fn dropped_files_prepare_confirmation_and_skip_folders() {
+        let harness = start_server(None).await;
+        let file = harness.downloads.join("note.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        assert!(matches!(
+            harness.context.prepare_dropped_files("phone-1", vec![file.clone()]),
+            SendPlan::Done(SyncResult::PhoneOffline)
+        ));
+
+        let _client = paired_client(&harness).await;
+        assert!(matches!(
+            harness.context.prepare_dropped_files("phone-1", vec![harness.downloads.clone()]),
+            SendPlan::Done(SyncResult::OnlyFolders)
+        ));
+        assert!(matches!(
+            harness.context.prepare_dropped_files("phone-1", vec![harness.downloads.join("missing.txt")]),
+            SendPlan::Done(SyncResult::FilesUnreadable)
+        ));
+        let SendPlan::Confirm(pending) = harness.context.prepare_dropped_files("phone-1", vec![harness.downloads.clone(), file])
+        else {
+            panic!("expected confirmation for dropped files");
+        };
+        assert_eq!(pending.phone, "Phone phone-1");
+        assert_eq!(pending.files.len(), 1);
+        assert_eq!(pending.files[0].name, "note.txt");
+        assert_eq!(pending.question(), "把 1 个文件（5 字节）发送到 Phone phone-1？");
     }
 
     #[tokio::test]

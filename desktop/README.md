@@ -6,5 +6,5 @@ EchoPad 电脑端常驻程序，基于 Tauri 2（Rust）+ React + TypeScript。
 
 ```bash
 pnpm install
-pnpm tauri dev
+pnpm start
 ```

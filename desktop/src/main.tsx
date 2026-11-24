@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { TitleBar } from "./TitleBar";
 import { Toaster } from "@/components/ui/sonner";
 import "./index.css";
 
@@ -12,7 +13,10 @@ darkScheme.addEventListener("change", applyScheme);
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <div className="flex h-screen flex-col">
+      <TitleBar />
+      <App />
+    </div>
     <Toaster />
   </React.StrictMode>,
 );
