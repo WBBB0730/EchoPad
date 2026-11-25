@@ -8,10 +8,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, InputError, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Direction, Enigo, InputError, Key, Keyboard, Mouse, Settings};
 
 /// 每隔这么久检查一次辅助功能权限：用户授权后无需重启电脑端；使用中被关掉时界面也会更新。
 const PERMISSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 手机端发来的滚动距离单位是点，换成系统的滚动单位。macOS 的平滑滚动也按点算。
+#[cfg(target_os = "macos")]
+const SCROLL_UNITS_PER_POINT: f32 = 1.0;
+/// Windows 的滚动单位是滚轮刻度，一格是 120；Chromium 一格滚 100 像素，按它换算（docs/prd/windows-desktop.md）。
+/// 这是估计值，要在真机上调。
+#[cfg(windows)]
+const SCROLL_UNITS_PER_POINT: f32 = 1.2;
+
+/// Windows 上缩放一档对应的缩放量（两指距离变化比例减 1 的累计），估计值，要在真机上调。
+#[cfg(any(windows, test))]
+const ZOOM_STEP: f32 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {
@@ -142,6 +154,7 @@ struct InputWorker<F, M> {
     held_modifiers: Vec<(Owner, Modifier)>,
     /// 正在缩放的连接：已经发出缩放开始、还没有发出结束。
     zooming: Option<Owner>,
+    zoom: Zoom,
 }
 
 impl<F: Fn(bool), M: Fn(MainThreadTask)> InputWorker<F, M> {
@@ -159,6 +172,7 @@ impl<F: Fn(bool), M: Fn(MainThreadTask)> InputWorker<F, M> {
             held: Vec::new(),
             held_modifiers: Vec::new(),
             zooming: None,
+            zoom: Zoom::new(),
         }
     }
 
@@ -183,13 +197,12 @@ impl<F: Fn(bool), M: Fn(MainThreadTask)> InputWorker<F, M> {
         tracing::trace!(?command, "input");
         match command {
             InputCommand::Move { dx, dy } => {
-                let (x, y) = self.pending_move.take_whole(dx, dy);
+                let scale = pointer::scale()?;
+                let (x, y) = self.pending_move.take_whole(dx * scale, dy * scale);
                 if (x, y) != (0, 0)
                     && let Some(enigo) = self.device.get()
                 {
-                    #[cfg(target_os = "macos")]
-                    let (x, y) = displays::confine(enigo.location()?, (x, y));
-                    enigo.move_mouse(x, y, Coordinate::Rel)?;
+                    pointer::move_by(enigo, (x, y))?;
                 }
             }
             InputCommand::Click { button, modifiers } => {
@@ -227,7 +240,7 @@ impl<F: Fn(bool), M: Fn(MainThreadTask)> InputWorker<F, M> {
                 self.release_modifiers(owner)?;
             }
             InputCommand::Scroll { dx, dy } => {
-                let (x, y) = self.pending_scroll.take_whole(dx, dy);
+                let (x, y) = self.pending_scroll.take_whole(dx * SCROLL_UNITS_PER_POINT, dy * SCROLL_UNITS_PER_POINT);
                 if let Some(enigo) = self.device.get() {
                     // enigo 的正值表示内容向上、向左移动，与手指方向相反。
                     if y != 0 {
@@ -242,13 +255,15 @@ impl<F: Fn(bool), M: Fn(MainThreadTask)> InputWorker<F, M> {
                 // 上一次缩放没收到结束（比如手机端的触控区被关掉了），先把它结束，保证每次缩放都有开始和结束。
                 self.end_zoom();
                 if self.device.get().is_some() {
-                    post_zoom(ZoomPhase::Began, 0.0);
+                    self.zoom.begin();
                     self.zooming = Some(owner);
                 }
             }
             InputCommand::Zoom { owner, magnification } => {
-                if self.zooming == Some(owner) {
-                    post_zoom(ZoomPhase::Changed, magnification.into());
+                if self.zooming == Some(owner)
+                    && let Some(enigo) = self.device.get()
+                {
+                    self.zoom.change(enigo, magnification)?;
                 }
             }
             InputCommand::ZoomEnd { owner } => {
@@ -360,7 +375,7 @@ impl<F: Fn(bool), M: Fn(MainThreadTask)> InputWorker<F, M> {
 
     fn end_zoom(&mut self) {
         if self.zooming.take().is_some() {
-            post_zoom(ZoomPhase::Ended, 0.0);
+            self.zoom.end();
         }
     }
 }
@@ -435,6 +450,97 @@ impl Fraction {
         self.y -= y;
         (x as i32, y as i32)
     }
+}
+
+/// macOS 上移动指针：手机端发来的位移单位是点，macOS 的指针坐标也是点，不用换算。
+#[cfg(target_os = "macos")]
+mod pointer {
+    use enigo::{Coordinate, Enigo, InputResult, Mouse};
+
+    pub fn scale() -> InputResult<f32> {
+        Ok(1.0)
+    }
+
+    pub fn move_by(enigo: &mut Enigo, delta: (i32, i32)) -> InputResult<()> {
+        let (x, y) = super::displays::confine(enigo.location()?, delta);
+        enigo.move_mouse(x, y, Coordinate::Rel)
+    }
+}
+
+/// Windows 上移动指针（docs/prd/windows-desktop.md）。指针坐标是物理像素，位移要乘以指针所在显示器的缩放比例。
+/// enigo 把移动换算成以主显示器为准的绝对坐标，指针到不了其他显示器，所以按整个虚拟桌面换算后自己发出；
+/// 目标落在显示器之间的空隙时，由系统挡在显示器上。
+#[cfg(windows)]
+mod pointer {
+    use enigo::{Enigo, InputError, InputResult};
+    use windows::Win32::{
+        Foundation::POINT,
+        Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint},
+        UI::{
+            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+            Input::KeyboardAndMouse::{
+                INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+                SendInput,
+            },
+            WindowsAndMessaging::{
+                GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            },
+        },
+    };
+
+    /// 缩放 100% 时的 DPI。
+    const DEFAULT_DPI: f32 = 96.0;
+
+    /// 指针所在显示器的缩放比例，例如缩放 150% 时是 1.5。
+    pub fn scale() -> InputResult<f32> {
+        let monitor = unsafe { MonitorFromPoint(location()?, MONITOR_DEFAULTTONEAREST) };
+        let (mut dpi_x, mut dpi_y) = (0, 0);
+        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+            .map_err(|_| InputError::Simulate("could not get the display scale"))?;
+        Ok(dpi_x as f32 / DEFAULT_DPI)
+    }
+
+    pub fn move_by(_enigo: &mut Enigo, (dx, dy): (i32, i32)) -> InputResult<()> {
+        let from = location()?;
+        let (left, top) = unsafe { (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)) };
+        let (width, height) = unsafe { (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) };
+        if width <= 0 || height <= 0 {
+            return Err(InputError::Simulate("could not get the size of the displays"));
+        }
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: super::absolute_coordinate(from.x + dx - left, width),
+                    dy: super::absolute_coordinate(from.y + dy - top, height),
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
+            return Err(InputError::Simulate("could not move the pointer"));
+        }
+        Ok(())
+    }
+
+    /// 指针的位置，在虚拟桌面上，单位是物理像素（电脑端按显示器感知缩放）。
+    fn location() -> InputResult<POINT> {
+        let mut point = POINT::default();
+        unsafe { GetCursorPos(&mut point) }.map_err(|_| InputError::Simulate("could not get the pointer location"))?;
+        Ok(point)
+    }
+}
+
+/// 虚拟桌面上的第 `offset` 个像素（从左边或上边数起）换成 Windows 的绝对坐标：0 到 65536 均分虚拟桌面的 `size` 个像素，
+/// 取像素的中心，系统换算回来时不论向下取整还是四舍五入都落在这个像素上，慢慢移动时不会卡在原地。超出虚拟桌面的贴着边。
+/// `size` 要大于 0。
+#[cfg(any(windows, test))]
+fn absolute_coordinate(offset: i32, size: i32) -> i32 {
+    let offset = i64::from(offset.clamp(0, size - 1));
+    ((2 * offset + 1) * 65536 / (2 * i64::from(size))) as i32
 }
 
 /// macOS 不会替模拟的移动挡住屏幕边缘：移到屏幕外的位置会被系统原样记下，指针虽然停在边上，
@@ -546,7 +652,80 @@ mod displays {
     }
 }
 
+/// macOS 上的缩放：发出和触控板捏合一样的原生手势（ADR-0012）。
+#[cfg(target_os = "macos")]
+struct Zoom;
+
+#[cfg(target_os = "macos")]
+impl Zoom {
+    fn new() -> Self {
+        Self
+    }
+
+    fn begin(&mut self) {
+        post_zoom(ZoomPhase::Began, 0.0);
+    }
+
+    fn change(&mut self, _enigo: &mut Enigo, magnification: f32) -> enigo::InputResult<()> {
+        post_zoom(ZoomPhase::Changed, magnification.into());
+        Ok(())
+    }
+
+    fn end(&mut self) {
+        post_zoom(ZoomPhase::Ended, 0.0);
+    }
+}
+
+/// Windows 上的缩放：缩放量每攒够一档，按住 Ctrl 滚一格滚轮，这是 Windows 上各种应用通行的缩放方式
+/// （docs/prd/windows-desktop.md）。
+#[cfg(windows)]
+struct Zoom {
+    steps: ZoomSteps,
+}
+
+#[cfg(windows)]
+impl Zoom {
+    fn new() -> Self {
+        Self { steps: ZoomSteps::default() }
+    }
+
+    fn begin(&mut self) {
+        self.steps = ZoomSteps::default();
+    }
+
+    /// Ctrl 随这几格滚轮按下、松开，不会一直按在电脑上（ADR-0016）。
+    fn change(&mut self, enigo: &mut Enigo, magnification: f32) -> enigo::InputResult<()> {
+        let steps = self.steps.take(magnification);
+        if steps == 0 {
+            return Ok(());
+        }
+        // 滚轮向上是放大；enigo 的正值是向下滚。
+        holding(enigo, &[Key::Control], |enigo| enigo.scroll(-steps, Axis::Vertical))
+    }
+
+    fn end(&mut self) {}
+}
+
+/// 把连续的缩放量攒成一档一档的。
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct ZoomSteps {
+    pending: f32,
+}
+
+#[cfg(any(windows, test))]
+impl ZoomSteps {
+    /// 加上这次的缩放量，返回攒够的档数：放大为正，缩小为负。不足一档的留到下次。
+    fn take(&mut self, magnification: f32) -> i32 {
+        self.pending += magnification;
+        let steps = (self.pending / ZOOM_STEP).trunc();
+        self.pending -= steps * ZOOM_STEP;
+        steps as i32
+    }
+}
+
 /// 缩放手势的阶段，取值与 macOS 的手势阶段一致。
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
 enum ZoomPhase {
     Began = 1,
@@ -578,10 +757,6 @@ fn post_zoom(phase: ZoomPhase, magnification: f64) {
     CGEvent::set_double_value_field(Some(&event), GESTURE_ZOOM_VALUE, magnification);
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
 }
-
-/// Windows 版再做。
-#[cfg(not(target_os = "macos"))]
-fn post_zoom(_phase: ZoomPhase, _magnification: f64) {}
 
 thread_local! {
     /// 主线程上的 enigo，只用来按快捷操作。它在主线程上创建，读取键盘布局时就直接在主线程读取。
@@ -737,6 +912,40 @@ mod tests {
         assert_eq!(fraction.take_whole(0.4, -0.4), (0, 0));
         assert_eq!(fraction.take_whole(0.4, -0.4), (1, -1));
         assert_eq!(fraction.take_whole(2.5, 0.0), (2, 0));
+    }
+
+    #[test]
+    fn each_pixel_maps_to_an_absolute_coordinate_that_lands_back_on_it() {
+        // 系统把绝对坐标换算回像素的两种可能：坐标 × 像素数 ÷ 65536 向下取整（Wine 的做法），
+        // 或者把 0 到 65535 对到第一个到最后一个像素、四舍五入。
+        let floor = |coordinate: i32, size: i32| (i64::from(coordinate) * i64::from(size)) >> 16;
+        let round = |coordinate: i32, size: i32| (f64::from(coordinate) * f64::from(size - 1) / 65535.0).round() as i64;
+        // 一块 1080p、并排两块 4K、和一块竖放的显示器拼起来的高度。
+        for size in [1, 1080, 1920, 7680, 4000] {
+            for offset in 0..size {
+                let coordinate = absolute_coordinate(offset, size);
+                assert_eq!(floor(coordinate, size), i64::from(offset));
+                assert_eq!(round(coordinate, size), i64::from(offset));
+            }
+        }
+    }
+
+    #[test]
+    fn a_target_outside_the_virtual_desktop_stays_at_its_edge() {
+        assert_eq!(absolute_coordinate(-5, 1920), absolute_coordinate(0, 1920));
+        assert_eq!(absolute_coordinate(1925, 1920), absolute_coordinate(1919, 1920));
+    }
+
+    #[test]
+    fn zoom_is_sent_once_a_whole_step_has_accumulated() {
+        let mut steps = ZoomSteps::default();
+        assert_eq!(steps.take(ZOOM_STEP * 0.6), 0);
+        assert_eq!(steps.take(ZOOM_STEP * 0.6), 1);
+        // 一次攒够好几档。
+        assert_eq!(steps.take(ZOOM_STEP * 2.0), 2);
+        // 缩小是负的，先抵掉还没用完的放大。
+        assert_eq!(steps.take(-ZOOM_STEP * 0.3), 0);
+        assert_eq!(steps.take(-ZOOM_STEP), -1);
     }
 
     #[test]

@@ -11,14 +11,14 @@
 | 目录 | 内容 | 技术栈 |
 |---|---|---|
 | `protocol/` | 两端共享的消息定义 | Protobuf |
-| `desktop/` | 电脑端：执行手机端发来的操作、模拟键鼠、把声音转发给识别服务 | Tauri 2（Rust）+ React + TypeScript |
+| `desktop/` | 电脑端（macOS、Windows）：执行手机端发来的操作、模拟键鼠、把声音转发给识别服务 | Tauri 2（Rust）+ React + TypeScript |
 | `mobile/` | 手机端 App，先做 Android，后续可加 iOS | Kotlin Multiplatform + Compose Multiplatform |
 
 应用标识：电脑端 `com.wbbb.echopad.desktop`（测试包是 `com.wbbb.echopad.desktop.dev`），手机端 `com.wbbb.echopad.mobile`（debug 构建是 `com.wbbb.echopad.mobile.debug`）。两端的测试包都显示为 `EchoPad Dev`。
 
 ## 电脑端
 
-前置条件见 [Tauri Prerequisites](https://tauri.app/start/prerequisites/)。
+前置条件见 [Tauri Prerequisites](https://tauri.app/start/prerequisites/)。Windows 上的 Rust 用 `stable-msvc` 工具链；仓库根的 `CLAUDE.md` 是指向 `AGENTS.md` 的符号链接，要先打开系统的开发人员模式，克隆时加上 `-c core.symlinks=true`，否则它会被检出成一个普通文本文件。
 
 ```bash
 cd desktop
@@ -26,9 +26,9 @@ pnpm install
 pnpm start
 ```
 
-`pnpm start` 运行的是测试包 `EchoPad Dev`：有自己的设置、配对和端口（47322），可以和正式版同时运行；它和打包装好的 `EchoPad Dev.app` 是同一个应用，两者不能同时运行。第一次运行时 macOS 会请求"辅助功能"权限，授权后电脑端才能控制指针和输入文字。
+`pnpm start` 运行的是测试包 `EchoPad Dev`：有自己的设置、配对和端口（47322），可以和正式版同时运行；它和打包装好的 `EchoPad Dev.app` 是同一个应用，两者不能同时运行。第一次运行时 macOS 会请求"辅助功能"权限，授权后电脑端才能控制指针和输入文字。Windows 不需要这个权限，但第一次运行时会弹出防火墙询问，要点允许，否则手机端连不上、也找不到这台电脑。
 
-语音输入需要用户自己的密钥（ADR-0007），在电脑端的"设置"里选择服务并填写。密钥和其他设置一起保存在 `~/Library/Application Support/com.wbbb.echopad.desktop/settings.json`（测试包在 `com.wbbb.echopad.desktop.dev` 下），只有当前用户可以读写。不填时其他功能照常可用。
+语音输入需要用户自己的密钥（ADR-0007），在电脑端的"设置"里选择服务并填写。密钥和其他设置一起保存在 `~/Library/Application Support/com.wbbb.echopad.desktop/settings.json`（Windows 上是 `%APPDATA%\com.wbbb.echopad.desktop\settings.json`；测试包在 `com.wbbb.echopad.desktop.dev` 下），只有当前用户可以读写。不填时其他功能照常可用。
 
 | 服务 | 获取密钥 |
 |---|---|
@@ -50,6 +50,8 @@ cargo test
 cd desktop
 APPLE_SIGNING_IDENTITY="Developer ID Application: …" pnpm build:dev
 ```
+
+在 Windows 上，同样的 `pnpm build:dev` 打出的是测试包的安装包，在 `desktop/src-tauri/target/release/bundle/nsis/`。包类型写在 `tauri.macos.conf.json`（只打 `.app`）和 `tauri.windows.conf.json`（只打 NSIS 安装包）里。Windows 安装包没有代码签名（ADR-0022），第一次运行时 Windows 会弹出警告，点"更多信息"再点"仍要运行"即可继续安装。
 
 macOS 26 起使用的应用图标，源文件是 `desktop/src-tauri/icons/AppIcon.icon`（Icon Composer 文档）。Tauri 打包时编译它会失败（[tauri-apps/tauri#16386](https://github.com/tauri-apps/tauri/issues/16386)），所以打包用的是预先编译好的 `icons/Assets.car`。改了图标后需要用 Xcode 26 以上重新生成；如果报 "Bad file descriptor"，先结束 `ibtoold` 进程再试：
 
@@ -87,7 +89,7 @@ npm run release
 
 它先拉取远端（本地与远端分叉时停下），再用 bumpp 交互选择新版本，改好版本号后提交、打 `vX.Y.Z` 标签并推送。bumpp 通过 npx 运行，不用安装依赖。工作区有未提交的改动时拒绝执行，避免漏提交的更新日志没跟上这一版。
 
-GitHub Actions 看到标签后检查两端、打包，全部成功后发到 GitHub Release，两端的应用内更新随之生效（`docs/prd/in-app-update.md`）。发版需要在仓库的 GitHub Secrets 里配好以下内容，Apple 那几项与 DevCube 的同名 Secret 相同：
+GitHub Actions 看到标签后检查两端，打 Mac、Windows 和安卓三个包，全部成功后发到 GitHub Release，两端的应用内更新随之生效（`docs/prd/in-app-update.md`）。发版需要在仓库的 GitHub Secrets 里配好以下内容，Apple 那几项与 DevCube 的同名 Secret 相同：
 
 | Secret | 内容 |
 |---|---|

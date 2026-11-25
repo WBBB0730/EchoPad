@@ -46,10 +46,14 @@ use crate::{
     update::{UpdateStatus, Updater},
 };
 
-/// 菜单栏图标的标识，手机端在线状态变化时据此更新右键菜单。
+/// 菜单栏图标（Windows 上是托盘图标）的标识，手机端在线状态变化时据此更新右键菜单。
 const TRAY_ID: &str = "main";
 /// 菜单栏图标用的单色模板图，由系统按菜单栏的深浅色着色。
+#[cfg(target_os = "macos")]
 const TRAY_ICON: Image<'_> = tauri::include_image!("icons/tray-template.png");
+/// 托盘图标用彩色的应用图标：任务栏不会给图标着色，黑色的模板图在深色任务栏上看不见（docs/prd/windows-desktop.md）。
+#[cfg(windows)]
+const TRAY_ICON: Image<'_> = tauri::include_image!("icons/32x32.png");
 /// 右键菜单里针对某部手机的菜单项，标识是这些前缀后面接手机端的固定标识：让它控制这台电脑、发送剪贴板、发送文件、发送文本。
 const SWITCH_MENU_PREFIX: &str = "switch:";
 const SYNC_CLIPBOARD_MENU_PREFIX: &str = "sync_clipboard:";
@@ -290,8 +294,15 @@ pub fn run() {
         objc2_foundation::ns_string!("Applying input from paired phones"),
     );
 
-    tauri::Builder::default()
-        .menu(app_menu)
+    let builder = tauri::Builder::default();
+    // Windows 上没有 macOS 的"重新打开"事件：再次打开 EchoPad 时由单实例插件显示已有的窗口，插件要最先注册
+    // （docs/prd/windows-desktop.md）。
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)));
+    // 应用菜单只在 macOS 上有：Windows 上它会显示在窗口里。
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(app_menu);
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
@@ -366,8 +377,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
-            // 冷启动时把主窗口带到前台。在后台运行时再次打开 EchoPad（例如在"应用程序"里双击），也显示窗口。
-            RunEvent::Ready | RunEvent::Reopen { .. } => show_main_window(app),
+            // 冷启动时把主窗口带到前台。
+            RunEvent::Ready => show_main_window(app),
+            // 在后台运行时再次打开 EchoPad（例如在"应用程序"里双击），也显示窗口。
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => show_main_window(app),
             _ => {}
         });
 }
@@ -439,13 +453,8 @@ fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )
 }
 
-/// Windows 版再做。
-#[cfg(not(target_os = "macos"))]
-fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
-    Menu::default(app)
-}
-
-/// 菜单栏图标：左键点击打开窗口；右键点击是菜单，可以重新打开窗口、让在线的手机端切换过来、退出电脑端。
+/// 菜单栏图标（Windows 上是托盘图标）：左键点击打开窗口；右键点击是菜单，可以重新打开窗口、让在线的手机端切换过来、
+/// 退出电脑端。
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TRAY_ICON)
@@ -518,7 +527,7 @@ fn update_tray_menu(app: &AppHandle, phones: &[PhoneStatus]) {
     }
 }
 
-/// 主窗口打开时程序坞里有图标；关掉窗口后只留在菜单栏。
+/// 主窗口打开时程序坞里有图标；关掉窗口后只留在菜单栏。Windows 上隐藏的窗口本来就不在任务栏上，只留在托盘里。
 fn show_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);

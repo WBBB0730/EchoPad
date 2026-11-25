@@ -77,3 +77,22 @@ objc2-core-graphics = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-system-configuration = "0.3.2"
 objc2-uniform-type-identifiers = "0.3.2"
+
+# Windows 版（docs/prd/windows-desktop.md）。
+[target.'cfg(windows)'.dependencies]
+# 再次打开 EchoPad 时显示已有的窗口：Windows 没有 macOS 的"重新打开"事件。
+tauri-plugin-single-instance = "2.5.5"
+# 读复制的文件要用 std 特性。
+clipboard-win = { version = "5.4.3", features = ["std"] }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+sanitize-filename = "0.6.0"
+# 与 Tauri 用的是同一个版本。
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }

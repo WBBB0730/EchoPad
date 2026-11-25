@@ -20,11 +20,17 @@ concurrency:
 
 jobs:
   desktop:
-    # 电脑端目前只支持 Mac，模拟键鼠等代码只在 macOS 上编译
-    runs-on: macos-latest
+    # 电脑端在 Mac 和 Windows 上各检查一遍，模拟键鼠、剪贴板等代码两个系统各有一份（docs/prd/windows-desktop.md）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: desktop
+        # Windows runner 默认用 PowerShell，下面的命令按 bash 写
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

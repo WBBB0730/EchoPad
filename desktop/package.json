@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "start": "tauri dev --config src-tauri/tauri.dev.conf.json",
-    "build:dev": "tauri build --bundles app --config src-tauri/tauri.dev.conf.json",
+    "build:dev": "tauri build --config src-tauri/tauri.dev.conf.json",
     "test": "vitest run",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "check": "pnpm build && pnpm typecheck:node && pnpm test",

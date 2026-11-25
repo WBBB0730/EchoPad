@@ -81,6 +81,7 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let name = file_name(Path::new(name));
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = tempfile::Builder::new();
     // 临时文件默认只有自己能读写；收到的文件是普通的下载，权限和新建的普通文件一样，由 umask 决定。
     #[cfg(unix)]
@@ -101,11 +102,16 @@ where
     unreachable!("there is always an unused name")
 }
 
-/// 只取文件名本身，丢掉前面的路径，手机端发来的文件不会写到"下载"文件夹以外。
+/// 只取文件名本身，丢掉前面的路径，手机端发来的文件不会写到"下载"文件夹以外。Windows 上再把文件名里不允许的字符
+/// 换成下划线、换掉系统保留的名字，否则存不下来（docs/prd/windows-desktop.md）。
 fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "未命名".into())
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    #[cfg(windows)]
+    let name = sanitize_filename::sanitize_with_options(
+        name,
+        sanitize_filename::Options { replacement: "_", ..Default::default() },
+    );
+    if name.is_empty() { "未命名".into() } else { name }
 }
 
 /// 重名时在文件名后加序号，例如"截图 (1).png"。
@@ -168,6 +174,15 @@ mod tests {
         let dir = temp_dir();
         assert_eq!(save(&dir, "../../etc/passwd", contents("x")).await.unwrap(), dir.join("passwd"));
         assert_eq!(save(&dir, "..", contents("x")).await.unwrap(), dir.join("未命名"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn names_windows_cannot_store_are_changed() {
+        let dir = temp_dir();
+        assert_eq!(save(&dir, "报告 \"终版\" 12:30?.pdf", contents("x")).await.unwrap(), dir.join("报告 _终版_ 12_30_.pdf"));
+        assert_eq!(save(&dir, "会议记录. ", contents("x")).await.unwrap(), dir.join("会议记录_"));
+        assert_eq!(save(&dir, "con.txt", contents("x")).await.unwrap(), dir.join("_"));
     }
 
     #[cfg(unix)]

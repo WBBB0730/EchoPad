@@ -14,6 +14,14 @@ export function checkReleaseTag(tag: string | undefined, version: string): void 
   }
 }
 
+/** 一个平台的电脑端更新包。 */
+export type UpdaterBundle = {
+  /** 下载地址 */
+  url: string;
+  /** 签名（.sig 文件的内容） */
+  signature: string;
+};
+
 /**
  * Tauri 官方格式的静态更新清单 `latest.json`。`notes` 放整份切好段的更新日志（JSON 字符串），
  * 两端按版本号挑段落（ADR-0011）；手机端也读这一份（docs/prd/in-app-update.md）。
@@ -22,17 +30,19 @@ export function updateManifest(input: {
   version: string;
   changelog: ChangelogEntry[];
   pubDate: Date;
-  /** Mac 更新包（.app.tar.gz）的下载地址 */
-  url: string;
-  /** Mac 更新包的签名（.sig 文件的内容） */
-  signature: string;
+  /** Mac 更新包（.app.tar.gz） */
+  mac: UpdaterBundle;
+  /** Windows 更新包，就是安装包本身（docs/prd/windows-desktop.md） */
+  windows: UpdaterBundle;
 }): string {
+  const bundle = ({ url, signature }: UpdaterBundle) => ({ signature: signature.trim(), url });
   const manifest = {
     version: input.version,
     notes: JSON.stringify(input.changelog),
     pub_date: input.pubDate.toISOString(),
     platforms: {
-      "darwin-aarch64": { signature: input.signature.trim(), url: input.url },
+      "darwin-aarch64": bundle(input.mac),
+      "windows-x86_64": bundle(input.windows),
     },
   };
   return `${JSON.stringify(manifest, null, 2)}\n`;

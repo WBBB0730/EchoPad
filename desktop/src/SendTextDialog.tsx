@@ -1,5 +1,5 @@
 // "发送文本"的输入框：打好字发给一部手机，进它的剪贴板，不动电脑自己的剪贴板（docs/prd/clipboard-sync.md）。
-// 主窗口里手机卡片上的按钮和菜单栏菜单共用；⌘↩ 也能发送。
+// 主窗口里手机卡片上的按钮和菜单栏菜单共用；⌘↩（Windows 上是 Ctrl+Enter）也能发送。
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -30,7 +30,7 @@ export function SendTextDialog({ phone, onClose }: { phone: { id: string; name: 
           value={text}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && event.metaKey) {
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
               event.preventDefault();
               send();
             }

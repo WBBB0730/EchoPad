@@ -210,7 +210,8 @@ impl Updater {
                 .open_url(format!("{RELEASES_URL}/tag/v{version}"), None::<&str>)
                 .map_err(|err| err.to_string());
         }
-        if self.install() {
+        // Windows 上装更新时，插件启动安装器后直接结束电脑端，安装器装完再打开它，不会走到重启这一步。
+        if self.install(true) {
             self.app.restart();
         }
         Err("安装更新失败".into())
@@ -218,16 +219,17 @@ impl Updater {
 
     /// 从菜单栏退出时，新版本已经下好就先装上，下次打开就是新版本。
     pub fn install_on_quit(&self) {
-        self.install();
+        self.install(false);
     }
 
-    fn install(&self) -> bool {
+    /// `reopen` 是 Windows 上的安装器装完后要不要打开电脑端；macOS 上安装只替换应用，本来就不打开。
+    fn install(&self, reopen: bool) -> bool {
         let installed = {
             let state = self.state.lock().unwrap();
             let Some((update, bytes)) = state.downloaded.as_ref() else {
                 return false;
             };
-            update.install(bytes)
+            update.clone().restart_after_install(reopen).install(bytes)
         };
         if let Err(err) = installed {
             tracing::error!("failed to install the update: {err}");

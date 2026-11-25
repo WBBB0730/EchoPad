@@ -1,4 +1,5 @@
 // 和系统标题栏融为一体的顶栏：左侧留给系统的窗口按钮，空白处可以拖动窗口，右侧是置顶按钮（DESIGN.md）。
+// Windows 上标题栏是系统自带的，这一条在它下面。
 import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PinIcon } from "lucide-react";

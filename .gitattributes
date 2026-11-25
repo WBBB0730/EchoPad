@@ -1,0 +1,6 @@
+# 文本文件在所有系统上都用 LF，Windows 上检出时也不换成 CRLF（docs/prd/windows-desktop.md）；
+# 是不是文本由 Git 自己判断，图片、图标这些二进制文件不受影响。
+* text=auto eol=lf
+
+# Windows 批处理文件一直按 CRLF 存在仓库里，原样检出，不做转换。
+*.bat -text

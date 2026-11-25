@@ -347,34 +347,204 @@ mod tests {
     }
 }
 
-/// Windows 版再做。
-#[cfg(not(target_os = "macos"))]
+/// Windows 的剪贴板（docs/prd/windows-desktop.md）。
+#[cfg(windows)]
 mod platform {
+    use std::{
+        io::Cursor,
+        num::NonZeroU32,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    use clipboard_win::{Clipboard as OpenClipboard, Getter, SysResult, formats, options::NoClear, raw};
+    use image::{DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader};
+
     use super::{Clipboard, ClipboardContent};
 
-    pub struct SystemClipboard;
+    /// 剪贴板正被别的应用占着时，打开前重试的次数，每次间隔 5 毫秒。
+    const OPEN_ATTEMPTS: usize = 10;
+
+    pub struct SystemClipboard {
+        /// 最近一次处理过的剪贴板序列号：看过的，或者自己写入后的。看序列号和写入都持有这把锁，
+        /// 自己的写入不会在写到一半时被当成用户复制的内容。
+        handled: Mutex<u32>,
+    }
 
     impl SystemClipboard {
         pub fn new() -> Self {
-            Self
+            Self { handled: Mutex::new(sequence_number()) }
         }
 
-        pub(super) fn copied_text(&self, _read: bool) -> Option<String> {
-            None
+        /// 剪贴板在上次查看之后有了新内容时，`read` 为 true 就读出其中的文字；为 false 时只记下看过了。
+        /// 复制的是文件时不读：那是要手动发送的文件，不是文字（docs/prd/send-files.md）。
+        pub(super) fn copied_text(&self, read: bool) -> Option<String> {
+            let mut handled = self.handled.lock().unwrap();
+            let count = sequence_number();
+            if count == *handled {
+                return None;
+            }
+            *handled = count;
+            if !read {
+                return None;
+            }
+            let _clipboard = open()?;
+            if is_skipped() || !files().is_empty() {
+                return None;
+            }
+            text()
         }
 
+        /// Windows 没有一律拒绝应用读剪贴板的设置。
         pub(super) fn access_denied(&self) -> bool {
             false
         }
+
+        /// 清空剪贴板再用 `write` 写入。这次写入不算用户复制的内容。
+        fn replace(&self, write: impl FnOnce() -> SysResult<()>) {
+            let mut handled = self.handled.lock().unwrap();
+            if let Some(_clipboard) = open()
+                && let Err(err) = raw::empty().and_then(|()| write())
+            {
+                tracing::warn!("failed to write the clipboard: {err}");
+            }
+            // 关上剪贴板以后再取序列号，写入引起的变化都已经算进去了。
+            *handled = sequence_number();
+        }
+    }
+
+    /// 剪贴板的序列号，内容每变一次加一，不用打开剪贴板就能读。
+    fn sequence_number() -> u32 {
+        raw::seq_num().map_or(0, NonZeroU32::get)
+    }
+
+    /// 打开剪贴板，用完随返回值一起关上。
+    fn open() -> Option<OpenClipboard> {
+        OpenClipboard::new_attempts(OPEN_ATTEMPTS)
+            .inspect_err(|err| tracing::warn!("failed to open the clipboard: {err}"))
+            .ok()
+    }
+
+    /// 微软约定的几种标记：带有它们的内容不进剪贴板历史、不同步到别的设备，密码管理器用它们标记复制的密码，
+    /// 这些内容也不同步。见微软文档的"Cloud Clipboard and Clipboard History Formats"。
+    fn is_skipped() -> bool {
+        let format = |name| raw::register_format(name).map(NonZeroU32::get);
+        // 放了任何数据都算。
+        if format("ExcludeClipboardContentFromMonitorProcessing").is_some_and(raw::is_format_avail) {
+            return true;
+        }
+        // 值是 0 的 DWORD 算。
+        ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"].into_iter().any(|name| {
+            format(name).is_some_and(|format| {
+                let mut value = Vec::new();
+                raw::is_format_avail(format)
+                    && formats::RawData(format).read_clipboard(&mut value).is_ok()
+                    && value.starts_with(&0u32.to_le_bytes())
+            })
+        })
+    }
+
+    /// 在资源管理器里复制的文件和文件夹，按复制的顺序。
+    fn files() -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if raw::is_format_avail(formats::CF_HDROP)
+            && let Err(err) = formats::FileList.read_clipboard(&mut files)
+        {
+            tracing::warn!("failed to read the copied files: {err}");
+        }
+        files
+    }
+
+    fn text() -> Option<String> {
+        let mut text = String::new();
+        if !raw::is_format_avail(formats::CF_UNICODETEXT) {
+            return None;
+        }
+        if let Err(err) = formats::Unicode.read_clipboard(&mut text) {
+            tracing::warn!("failed to read the copied text: {err}");
+            return None;
+        }
+        Some(text).filter(|text| !text.is_empty())
+    }
+
+    /// 剪贴板上的图片，转成 PNG。浏览器等应用会另放一份 PNG；截图等只放位图，转成 PNG。
+    fn image() -> Option<Vec<u8>> {
+        if let Some(png) = raw::register_format("PNG").map(NonZeroU32::get).filter(|&png| raw::is_format_avail(png)) {
+            let mut data = Vec::new();
+            match formats::RawData(png).read_clipboard(&mut data) {
+                Ok(_) => return Some(data),
+                Err(err) => tracing::warn!("failed to read the copied PNG: {err}"),
+            }
+        }
+        if !raw::is_format_avail(formats::CF_BITMAP) {
+            return None;
+        }
+        let mut bmp = Vec::new();
+        if let Err(err) = formats::Bitmap.read_clipboard(&mut bmp) {
+            tracing::warn!("failed to read the copied bitmap: {err}");
+            return None;
+        }
+        let mut png = Vec::new();
+        let converted = image::load_from_memory_with_format(&bmp, ImageFormat::Bmp)
+            .and_then(|image| image.write_to(&mut Cursor::new(&mut png), ImageFormat::Png));
+        match converted {
+            Ok(()) => Some(png),
+            Err(err) => {
+                tracing::warn!("failed to convert the copied bitmap: {err}");
+                None
+            }
+        }
+    }
+
+    /// 图片文件换成位图（BMP 文件的内容）。按扩展名看不是图片、或者读不了时为 `None`。
+    fn bitmap(path: &Path) -> Option<Vec<u8>> {
+        ImageFormat::from_path(path).ok()?;
+        let decoded = ImageReader::open(path).map_err(ImageError::from).and_then(|reader| {
+            let mut decoder = reader.into_decoder()?;
+            // 手机拍的照片靠 EXIF 里的方向信息转正，解码时不会自动转。
+            let orientation = decoder.orientation()?;
+            let mut image = DynamicImage::from_decoder(decoder)?;
+            image.apply_orientation(orientation);
+            Ok(image)
+        });
+        let image = decoded.inspect_err(|err| tracing::warn!("failed to read the image: {err}")).ok()?;
+        // 带透明度的 BMP 用的是 clipboard-win 认不了的文件头，所以换成不透明的 RGB。
+        let mut bmp = Vec::new();
+        DynamicImage::ImageRgb8(image.to_rgb8())
+            .write_to(&mut Cursor::new(&mut bmp), ImageFormat::Bmp)
+            .inspect_err(|err| tracing::warn!("failed to convert the image: {err}"))
+            .ok()?;
+        Some(bmp)
     }
 
     impl Clipboard for SystemClipboard {
         fn read(&self) -> Option<ClipboardContent> {
-            None
+            let _clipboard = open()?;
+            let files = files();
+            if !files.is_empty() {
+                return Some(ClipboardContent::Files(files));
+            }
+            text().map(ClipboardContent::Text).or_else(|| image().map(ClipboardContent::Image))
         }
 
-        fn write(&self, _text: &str) {}
+        fn write(&self, text: &str) {
+            self.replace(|| raw::set_string_with(text, NoClear));
+        }
 
-        fn write_files(&self, _files: &[std::path::PathBuf]) {}
+        fn write_files(&self, files: &[PathBuf]) {
+            // 解码图片可能要一会儿，先做好再打开剪贴板。
+            let bitmap = match files {
+                [path] => bitmap(path),
+                _ => None,
+            };
+            let paths: Vec<_> = files.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+            self.replace(|| {
+                raw::set_file_list_with(&paths, NoClear)?;
+                if let Some(bitmap) = &bitmap {
+                    raw::set_bitmap_with(bitmap, NoClear)?;
+                }
+                Ok(())
+            });
+        }
     }
 }

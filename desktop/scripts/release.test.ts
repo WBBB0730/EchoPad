@@ -19,7 +19,7 @@ describe("checkReleaseTag", () => {
 });
 
 describe("updateManifest", () => {
-  it("整份更新日志以 JSON 写进 notes，签名去掉首尾空白", () => {
+  it("整份更新日志以 JSON 写进 notes，Mac 和 Windows 各一项，签名去掉首尾空白", () => {
     const changelog = [
       { version: "1.1.0", date: null, body: "- 新增缩放" },
       { version: "1.0.0", date: "2026-10-01", body: "- 新增手机键盘" },
@@ -29,8 +29,8 @@ describe("updateManifest", () => {
         version: "1.1.0",
         changelog,
         pubDate: new Date("2026-10-29T00:00:00Z"),
-        url: "https://example.com/EchoPad.app.tar.gz",
-        signature: "c2lnbmF0dXJl\n",
+        mac: { url: "https://example.com/EchoPad.app.tar.gz", signature: "bWFj\n" },
+        windows: { url: "https://example.com/EchoPad_1.1.0_x64-setup.exe", signature: "d2luZG93cw==\r\n" },
       }),
     );
     expect(manifest).toEqual({
@@ -38,7 +38,8 @@ describe("updateManifest", () => {
       notes: JSON.stringify(changelog),
       pub_date: "2026-10-29T00:00:00.000Z",
       platforms: {
-        "darwin-aarch64": { signature: "c2lnbmF0dXJl", url: "https://example.com/EchoPad.app.tar.gz" },
+        "darwin-aarch64": { signature: "bWFj", url: "https://example.com/EchoPad.app.tar.gz" },
+        "windows-x86_64": { signature: "d2luZG93cw==", url: "https://example.com/EchoPad_1.1.0_x64-setup.exe" },
       },
     });
   });

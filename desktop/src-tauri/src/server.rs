@@ -1436,7 +1436,9 @@ mod tests {
         let status = harness.upload(Some(&device_key), &[("照片.jpg", "jpeg"), ("报告 \"终版\".pdf", "pdf")]).await;
 
         assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
-        let saved = vec![harness.downloads.join("照片 (1).jpg"), harness.downloads.join("报告 \"终版\".pdf")];
+        // Windows 的文件名里不能有双引号，换成了下划线。
+        let report = if cfg!(windows) { "报告 _终版_.pdf" } else { "报告 \"终版\".pdf" };
+        let saved = vec![harness.downloads.join("照片 (1).jpg"), harness.downloads.join(report)];
         assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), "jpeg");
         assert_eq!(std::fs::read_to_string(&saved[1]).unwrap(), "pdf");
         assert_eq!(harness.clipboard.written(), [ClipboardContent::Files(saved)]);
